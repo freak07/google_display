@@ -329,12 +329,12 @@ static void s6e3hc3_update_te2(struct exynos_panel *ctx)
 		width[5] = (falling >> 8) & 0xF;
 		width[6] = falling & 0xFF;
 	} else if (ret == -EAGAIN) {
-		dev_err(ctx->dev, "Panel is not ready, use default setting\n");
+		dev_dbg(ctx->dev, "Panel is not ready, use default setting\n");
 	} else {
 		return;
 	}
 
-	dev_err(ctx->dev,
+	dev_dbg(ctx->dev,
 		"TE2 updated: option %s, idle %s, width 0xb9 0x%x 0x%x 0x%x 0x%x 0x%x 0x%x\n",
 		(option == S6E3HC3_TE2_CHANGEABLE) ? "changeable" : "fixed",
 		ctx->panel_idle_vrefresh ? "active" : "inactive",
@@ -371,7 +371,7 @@ static void s6e3hc3_update_early_exit(struct exynos_panel *ctx, bool enable)
 	const struct s6e3hc3_panel *spanel = to_spanel(ctx);
 	const u32 flags = PANEL_CMD_SET_QUEUE;
 
-	dev_err(ctx->dev, "%s: en=%d\n", __func__, enable);
+	dev_dbg(ctx->dev, "%s: en=%d\n", __func__, enable);
 
 	if (enable) {
 		exynos_panel_send_cmd_set_flags(ctx, &s6e3hc3_early_exit_enable_cmd_set, flags);
@@ -401,7 +401,7 @@ static u32 s6e3hc3_get_min_idle_vrefresh(struct exynos_panel *ctx,
 		return 0;
 
 	if (idle_vrefresh >= vrefresh) {
-		dev_err(ctx->dev, "idle vrefresh (%u) higher than target (%u)\n",
+		dev_dbg(ctx->dev, "idle vrefresh (%u) higher than target (%u)\n",
 			idle_vrefresh, vrefresh);
 		return 0;
 	}
@@ -443,7 +443,7 @@ static void s6e3hc3_set_early_exit_auto_mode(struct exynos_panel *ctx,
 		return;
 	}
 
-	dev_err(ctx->dev, "%s: sending %uhz step setting (idle_fps=%u)\n",
+	dev_dbg(ctx->dev, "%s: sending %uhz step setting (idle_fps=%u)\n",
 		__func__, step_vrefresh, idle_vrefresh);
 
 	s6e3hc3_update_early_exit(ctx, true);
@@ -481,11 +481,11 @@ static void s6e3hc3_update_refresh_mode(struct exynos_panel *ctx,
 	EXYNOS_DCS_WRITE_TABLE(ctx, unlock_cmd_f0);
 
 	if (idle_vrefresh) {
-		dev_err(ctx->dev, "%s: mode: %s with auto mode idle_vrefresh: %d\n", __func__,
+		dev_dbg(ctx->dev, "%s: mode: %s with auto mode idle_vrefresh: %d\n", __func__,
 			pmode->mode.name, idle_vrefresh);
 		s6e3hc3_set_early_exit_auto_mode(ctx, idle_vrefresh);
 	} else {
-		dev_err(ctx->dev, "%s: mode: %s in manual mode\n", __func__,
+		dev_dbg(ctx->dev, "%s: mode: %s in manual mode\n", __func__,
 			pmode->mode.name);
 
 		s6e3hc3_update_early_exit(ctx, false);
@@ -515,7 +515,7 @@ static void s6e3hc3_change_frequency(struct exynos_panel *ctx,
 
 	s6e3hc3_update_refresh_mode(ctx, pmode, idle_vrefresh);
 
-	dev_err(ctx->dev, "%s: change to %uhz\n", __func__, drm_mode_vrefresh(&pmode->mode));
+	dev_dbg(ctx->dev, "%s: change to %uhz\n", __func__, drm_mode_vrefresh(&pmode->mode));
 }
 
 static bool s6e3hc3_set_self_refresh(struct exynos_panel *ctx, bool enable)
@@ -542,7 +542,7 @@ static bool s6e3hc3_set_self_refresh(struct exynos_panel *ctx, bool enable)
 		 */
 		if ((pmode->idle_mode == IDLE_MODE_ON_INACTIVITY) &&
 		    (spanel->auto_mode_vrefresh != idle_vrefresh)) {
-			dev_err(ctx->dev,
+			dev_dbg(ctx->dev,
 				"early exit update needed for mode: %s (idle_vrefresh: %d)\n",
 				pmode->mode.name, idle_vrefresh);
 			s6e3hc3_update_refresh_mode(ctx, pmode, idle_vrefresh);
@@ -561,7 +561,7 @@ static bool s6e3hc3_set_self_refresh(struct exynos_panel *ctx, bool enable)
 	DPU_ATRACE_BEGIN(__func__);
 	ctx->panel_idle_vrefresh = idle_vrefresh;
 
-	dev_err(ctx->dev, "change panel idle vrefresh: %u for mode: %s\n", idle_vrefresh,
+	dev_dbg(ctx->dev, "change panel idle vrefresh: %u for mode: %s\n", idle_vrefresh,
 		pmode->mode.name);
 
 	EXYNOS_DCS_WRITE_TABLE(ctx, unlock_cmd_f0);
@@ -613,7 +613,7 @@ static int s6e3hc3_atomic_check(struct exynos_panel *ctx, struct drm_atomic_stat
 
 		if (mode->clock != new_crtc_state->mode.clock) {
 			new_crtc_state->mode_changed = true;
-			dev_err(ctx->dev, "raise mode (%s) clock to 120hz on %s\n",
+			dev_dbg(ctx->dev, "raise mode (%s) clock to 120hz on %s\n",
 				mode->name,
 				old_crtc_state->self_refresh_active ? "self refresh exit" : "resume");
 		}
@@ -622,7 +622,7 @@ static int s6e3hc3_atomic_check(struct exynos_panel *ctx, struct drm_atomic_stat
 		/* clock hacked in last commit due to self refresh exit or resume, undo that */
 		new_crtc_state->mode_changed = true;
 		new_crtc_state->adjusted_mode.clock = new_crtc_state->mode.clock;
-		dev_err(ctx->dev, "restore mode (%s) clock after self refresh exit or resume\n",
+		dev_dbg(ctx->dev, "restore mode (%s) clock after self refresh exit or resume\n",
 			new_crtc_state->mode.name);
 	}
 
@@ -643,7 +643,7 @@ static void s6e3hc3_write_display_mode(struct exynos_panel *ctx,
 	if (ctx->dimming_on)
 		val |= S6E3HC3_WRCTRLD_DIMMING_BIT;
 
-	dev_err(ctx->dev,
+	dev_dbg(ctx->dev,
 		"%s(wrctrld:0x%x, hbm: %s, dimming: %s local_hbm: %s)\n",
 		__func__, val, IS_HBM_ON(ctx->hbm_mode) ? "on" : "off",
 		ctx->dimming_on ? "on" : "off",
@@ -753,7 +753,7 @@ static void s6e3hc3_lhbm_gamma_write(struct exynos_panel *ctx)
 static void s6e3hc3_extra_lhbm_settings(struct exynos_panel *ctx,
 				 bool local_hbm_en)
 {
-	dev_err(ctx->dev, "%s(panel_rev: 0x%x)\n", __func__, ctx->panel_rev);
+	dev_dbg(ctx->dev, "%s(panel_rev: 0x%x)\n", __func__, ctx->panel_rev);
 	if (ctx->panel_rev >= PANEL_REV_EVT1) {
 		EXYNOS_DCS_WRITE_TABLE_FLAGS(ctx, unlock_cmd_f0, 0);
 		if (local_hbm_en) {
@@ -835,7 +835,7 @@ static int s6e3hc3_enable(struct drm_panel *panel)
 	}
 	mode = &pmode->mode;
 
-	dev_err(ctx->dev, "%s\n", __func__);
+	dev_dbg(ctx->dev, "%s\n", __func__);
 
 	exynos_panel_reset(ctx);
 
@@ -878,7 +878,7 @@ static void s6e3hc3_trigger_early_exit(struct exynos_panel *ctx)
 	const s64 delta_us = ktime_to_us(delta);
 
 	if (delta_us < EARLY_EXIT_THRESHOLD_US) {
-		dev_err(ctx->dev, "skip early exit. %lldus since last commit\n",
+		dev_dbg(ctx->dev, "skip early exit. %lldus since last commit\n",
 			delta_us);
 		return;
 	}
@@ -896,9 +896,9 @@ static void s6e3hc3_trigger_early_exit(struct exynos_panel *ctx)
 		 */
 		s6e3hc3_set_manual_mode(ctx, pmode);
 
-		dev_err(ctx->dev, "%s: set manual mode for: %s\n", __func__, pmode->mode.name);
+		dev_dbg(ctx->dev, "%s: set manual mode for: %s\n", __func__, pmode->mode.name);
 	} else {
-		dev_err(ctx->dev, "sending early exit out cmd\n");
+		dev_dbg(ctx->dev, "sending early exit out cmd\n");
 		EXYNOS_DCS_WRITE_TABLE(ctx, freq_update);
 	}
 	EXYNOS_DCS_WRITE_TABLE(ctx, lock_cmd_f0);
