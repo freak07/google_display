@@ -11,6 +11,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/console.h>
 #include <linux/debugfs.h>
 #include <linux/ktime.h>
 #include <linux/moduleparam.h>
@@ -44,11 +45,17 @@ static unsigned int dpu_event_log_max = 1024;
 static unsigned int dpu_event_print_max = 512;
 static unsigned int dpu_event_print_underrun = 128;
 static unsigned int dpu_event_print_fail_update_bw = 32;
+static unsigned int dpu_debug_dump_mask = DPU_EVT_CONDITION_DEFAULT |
+	DPU_EVT_CONDITION_UNDERRUN | DPU_EVT_CONDITION_FAIL_UPDATE_BW |
+	DPU_EVT_CONDITION_FIFO_TIMEOUT;
 
 module_param_named(event_log_max, dpu_event_log_max, uint, 0);
 module_param_named(event_print_max, dpu_event_print_max, uint, 0600);
+module_param_named(debug_dump_mask, dpu_debug_dump_mask, uint, 0600);
+
 MODULE_PARM_DESC(event_log_max, "entry count of event log buffer array");
 MODULE_PARM_DESC(event_print_max, "print entry count of event log buffer");
+MODULE_PARM_DESC(debug_dump_mask, "mask for dump debug event log");
 
 /* If event are happened continuously, then ignore */
 static bool dpu_event_ignore
@@ -327,6 +334,9 @@ void DPU_EVENT_LOG_ATOMIC_COMMIT(int index)
 		}
 	}
 
+	memcpy(&log->data.atomic.rcd_win_config, &decon->bts.rcd_win_config,
+	       sizeof(log->data.atomic.rcd_win_config));
+
 	log->type = DPU_EVT_ATOMIC_COMMIT;
 }
 
@@ -389,16 +399,33 @@ DPU_EVENT_LOG_CMD(struct dsim_device *dsim, u8 type, u8 d0, u16 len)
 	log->type = DPU_EVT_DSIM_COMMAND;
 }
 
+static void dpu_print_log_win_config(const struct decon_win_config *const win_config, int index,
+				     bool is_rcd, struct drm_printer *p)
+{
+	static const char *const str_state[3] = { "DISABLED", "COLOR", "BUFFER" };
+	const struct dpu_bts_win_config *const win = &win_config->win;
+	const struct dpu_fmt *const fmt = dpu_find_fmt_info(win->format);
+
+	char buf[128];
+	int len = scnprintf(buf, sizeof(buf), "\t\t\t\t\t%s%d: %s[0x%llx] SRC[%d %d %d %d] %s%s%s",
+			    is_rcd ? "RCD" : "WIN", index, str_state[win->state],
+			    (win->state == DPU_WIN_STATE_BUFFER) ? win_config->dma_addr : 0,
+			    win->src_x, win->src_y, win->src_w, win->src_h,
+			    (win->is_comp) ? "AFBC " : "", (win->is_rot) ? "ROT " : "",
+			    (win->is_secure) ? "SECURE " : "");
+	len += scnprintf(buf + len, sizeof(buf) - len, "DST[%d %d %d %d] ", win->dst_x, win->dst_y,
+			 win->dst_w, win->dst_h);
+	if (win->state == DPU_WIN_STATE_BUFFER)
+		len += scnprintf(buf + len, sizeof(buf) - len, "CH%d", win->dpp_ch);
+
+	drm_printf(p, "%s %s %s\n", buf, dpu_get_fmt_name(fmt), get_comp_src_name(win->comp_src));
+}
+
 static void dpu_print_log_atomic(struct dpu_log_atomic *atomic,
 						struct drm_printer *p)
 {
 	int i;
-	struct dpu_bts_win_config *win;
-	char *str_state[3] = {"DISABLED", "COLOR", "BUFFER"};
-	const char *str_comp;
-	const struct dpu_fmt *fmt;
-	char buf[128];
-	int len;
+	const struct dpu_bts_win_config *win;
 
 	for (i = 0; i < MAX_WIN_PER_DECON; ++i) {
 		win = &atomic->win_config[i].win;
@@ -411,26 +438,12 @@ static void dpu_print_log_atomic(struct dpu_log_atomic *atomic,
 			pr_warn("%s: invalid win state %d\n", __func__, win->state);
 			continue;
 		}
+		dpu_print_log_win_config(&atomic->win_config[i], i, false, p);
+	}
 
-		fmt = dpu_find_fmt_info(win->format);
-
-		len = scnprintf(buf, sizeof(buf),
-				"\t\t\t\t\tWIN%d: %s[0x%llx] SRC[%d %d %d %d] %s %s ",
-				i, str_state[win->state],
-				(win->state == DPU_WIN_STATE_BUFFER) ?
-				atomic->win_config[i].dma_addr : 0,
-				win->src_x, win->src_y, win->src_w, win->src_h,
-				(win->is_comp) ? "AFBC" : "",
-				(win->is_rot) ? "ROT" : "");
-		len += scnprintf(buf + len, sizeof(buf) - len,
-				"DST[%d %d %d %d] ",
-				win->dst_x, win->dst_y, win->dst_w, win->dst_h);
-		if (win->state == DPU_WIN_STATE_BUFFER)
-			len += scnprintf(buf + len, sizeof(buf) - len, "CH%d ",
-					win->dpp_ch);
-
-		str_comp = get_comp_src_name(win->comp_src);
-		drm_printf(p, "%s %s %s\n", buf, fmt ? fmt->name : "Unknown", str_comp);
+	win = &atomic->rcd_win_config.win;
+	if (win->state == DPU_WIN_STATE_BUFFER) {
+		dpu_print_log_win_config(&atomic->rcd_win_config, 0, true, p);
 	}
 }
 
@@ -524,7 +537,7 @@ static const char *get_event_name(enum dpu_event_type type)
 
 static bool is_skip_dpu_event_dump(enum dpu_event_type type, enum dpu_event_condition condition)
 {
-	if (condition == DPU_EVT_CONDITION_ALL)
+	if (condition == DPU_EVT_CONDITION_DEFAULT)
 		return false;
 
 	if (condition == DPU_EVT_CONDITION_UNDERRUN) {
@@ -725,14 +738,10 @@ static void dpu_event_log_print(const struct decon_device *decon, struct drm_pri
 		case DPU_EVT_PLANE_PREPARE_FB:
 		case DPU_EVT_PLANE_CLEANUP_FB:
 			fmt = dpu_find_fmt_info(log->data.plane_info.format);
-			scnprintf(buf + len, sizeof(buf) - len,
-					"\tWIN%u: 0x%llx, %ux%u, CH%u, %s",
-					log->data.plane_info.zpos,
-					log->data.plane_info.dma_addr,
-					log->data.plane_info.width,
-					log->data.plane_info.height,
-					log->data.plane_info.index,
-					fmt ? fmt->name : "Unknown");
+			scnprintf(buf + len, sizeof(buf) - len, "\tWIN%u: 0x%llx, %ux%u, CH%u, %s",
+				  log->data.plane_info.zpos, log->data.plane_info.dma_addr,
+				  log->data.plane_info.width, log->data.plane_info.height,
+				  log->data.plane_info.index, dpu_get_fmt_name(fmt));
 			break;
 		case DPU_EVT_PLANE_UPDATE:
 		case DPU_EVT_PLANE_DISABLE:
@@ -825,7 +834,7 @@ static int dpu_debug_event_show(struct seq_file *s, void *unused)
 	struct decon_device *decon = s->private;
 	struct drm_printer p = drm_seq_file_printer(s);
 
-	dpu_event_log_print(decon, &p, dpu_event_log_max, DPU_EVT_CONDITION_ALL);
+	dpu_event_log_print(decon, &p, dpu_event_log_max, DPU_EVT_CONDITION_DEFAULT);
 	return 0;
 }
 
@@ -1410,10 +1419,12 @@ static const struct file_operations recovery_fops = {
 
 static void buf_dump_all(const struct decon_device *decon)
 {
+	struct drm_printer p = console_set_on_cmdline ?
+		drm_debug_printer("[drm]") : drm_info_printer(decon->dev);
 	int i;
 
 	for (i = 0; i < decon->dpp_cnt; ++i)
-		dpp_dump_buffer(decon->dpp[i]);
+		dpp_dump_buffer(&p, decon->dpp[i]);
 }
 
 static void buf_dump_handler(struct kthread_work *work)
@@ -1714,42 +1725,57 @@ err:
 
 #define PREFIX_LEN	40
 #define ROW_LEN		32
-void dpu_print_hex_dump(void __iomem *regs, const void *buf, size_t len)
+void dpu_print_hex_dump(struct drm_printer *p, void __iomem *regs, const void *buf, size_t len)
 {
 	char prefix_buf[PREFIX_LEN];
-	unsigned long p;
-	int i, row;
+	unsigned char linebuf[96];
+	unsigned long offset;
+	int i, linelen;
 
 	for (i = 0; i < len; i += ROW_LEN) {
-		p = buf - regs + i;
+		const u8 *ptr = buf + i;
+
+		offset = buf - regs + i;
 
 		if (len - i < ROW_LEN)
-			row = len - i;
+			linelen = len - i;
 		else
-			row = ROW_LEN;
+			linelen = ROW_LEN;
 
-		snprintf(prefix_buf, sizeof(prefix_buf), "[%08lX] ", p);
-		print_hex_dump(KERN_INFO, prefix_buf, DUMP_PREFIX_NONE,
-				32, 4, buf + i, row, false);
+		snprintf(prefix_buf, sizeof(prefix_buf), "[%08lX] ", offset);
+		hex_dump_to_buffer(ptr, linelen, ROW_LEN, 4,
+				linebuf, sizeof(linebuf), false);
+
+		drm_printf(p, "%s%s\n", prefix_buf, linebuf);
 	}
 }
 
+static bool decon_dump_ignore(enum dpu_event_condition condition)
+{
+	return !(dpu_debug_dump_mask & condition);
+}
+
 void decon_dump_all(struct decon_device *decon,
-		enum dpu_event_condition cond, bool async_buf_dump)
+		enum dpu_event_condition condition, bool async_buf_dump)
 {
 	bool active = pm_runtime_active(decon->dev);
 	struct kthread_worker *worker = &decon->worker;
 
-	pr_info("DPU power %s state\n", active ? "on" : "off");
+	pr_info("%s: power %s state\n",
+		dev_name(decon->dev), active ? "on" : "off");
 
-	if ((cond == DPU_EVT_CONDITION_ALL) || (cond == DPU_EVT_CONDITION_IDMA_ERROR)) {
+	if (decon_dump_ignore(condition))
+		return;
+
+	if ((condition == DPU_EVT_CONDITION_DEFAULT) ||
+		(condition == DPU_EVT_CONDITION_IDMA_ERROR)) {
 		if (async_buf_dump)
 			kthread_queue_work(worker, &decon->buf_dump_work);
 		else
 			buf_dump_all(decon);
 	}
 
-	decon_dump_event_condition(decon, cond);
+	decon_dump_event_condition(decon, condition);
 
 	if (active)
 		decon_dump(decon);
@@ -1758,8 +1784,12 @@ void decon_dump_all(struct decon_device *decon,
 void decon_dump_event_condition(const struct decon_device *decon,
 		enum dpu_event_condition condition)
 {
-	struct drm_printer p = drm_info_printer(decon->dev);
+	struct drm_printer p = console_set_on_cmdline ?
+		drm_debug_printer("[drm]") : drm_info_printer(decon->dev);
 	u32 print_log_size;
+
+	if (decon_dump_ignore(condition))
+		return;
 
 	switch (condition) {
 	case DPU_EVT_CONDITION_UNDERRUN:
@@ -1770,7 +1800,7 @@ void decon_dump_event_condition(const struct decon_device *decon,
 	case DPU_EVT_CONDITION_FAIL_UPDATE_BW:
 		print_log_size = dpu_event_print_fail_update_bw;
 		break;
-	case DPU_EVT_CONDITION_ALL:
+	case DPU_EVT_CONDITION_DEFAULT:
 	default:
 		print_log_size = dpu_event_print_max;
 		break;
@@ -1803,7 +1833,7 @@ int dpu_itmon_notifier(struct notifier_block *nb, unsigned long act, void *data)
 		pr_info("%s: port: %s, dest: %s\n", __func__,
 				itmon_data->port, itmon_data->dest);
 
-		decon_dump_all(decon, DPU_EVT_CONDITION_ALL, true);
+		decon_dump_all(decon, DPU_EVT_CONDITION_DEFAULT, true);
 
 		decon->itmon_notified = true;
 		return NOTIFY_OK;

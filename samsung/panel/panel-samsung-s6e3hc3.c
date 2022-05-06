@@ -596,7 +596,8 @@ static int s6e3hc3_atomic_check(struct exynos_panel *ctx, struct drm_atomic_stat
 	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
 	struct s6e3hc3_panel *spanel = to_spanel(ctx);
 
-	if (!new_conn_state || !new_conn_state->crtc)
+	if (drm_mode_vrefresh(&ctx->current_mode->mode) == 120 ||
+	    !new_conn_state || !new_conn_state->crtc)
 		return 0;
 
 	new_crtc_state = drm_atomic_get_new_crtc_state(state, new_conn_state->crtc);
@@ -663,6 +664,7 @@ static void s6e3hc3_set_nolp_mode(struct exynos_panel *ctx,
 
 	EXYNOS_DCS_WRITE_TABLE(ctx, display_off);
 	EXYNOS_DCS_WRITE_SEQ(ctx, 0xF0, 0x5A, 0x5A);
+	/* backlight control and dimming */
 	s6e3hc3_write_display_mode(ctx, &pmode->mode);
 	if (ctx->panel_rev == PANEL_REV_PROTO1)
 		EXYNOS_DCS_WRITE_SEQ(ctx, 0x49, 0x02);	/* normal gamma */
@@ -1008,6 +1010,10 @@ static void s6e3hc3_set_dimming_on(struct exynos_panel *ctx,
 	const struct exynos_panel_mode *pmode = ctx->current_mode;
 
 	ctx->dimming_on = dimming_on;
+	if (pmode->exynos_mode.is_lp_mode) {
+		dev_info(ctx->dev,"in lp mode, skip to update");
+		return;
+	}
 	s6e3hc3_write_display_mode(ctx, &pmode->mode);
 }
 
@@ -1107,6 +1113,7 @@ static const struct exynos_panel_mode s6e3hc3_modes[] = {
 		.exynos_mode = {
 			.mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS,
 			.vblank_usec = 120,
+			.te_usec = 8500,
 			.bpc = 8,
 			.dsc = {
 				.enabled = true,
@@ -1143,6 +1150,7 @@ static const struct exynos_panel_mode s6e3hc3_modes[] = {
 		.exynos_mode = {
 			.mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS,
 			.vblank_usec = 120,
+			.te_usec = 146,
 			.bpc = 8,
 			.dsc = {
 				.enabled = true,
@@ -1181,6 +1189,7 @@ static const struct exynos_panel_mode s6e3hc3_lp_mode = {
 	.exynos_mode = {
 		.mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS,
 		.vblank_usec = 120,
+		.te_usec = 25200,
 		.bpc = 8,
 		.dsc = {
 			.enabled = true,

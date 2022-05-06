@@ -87,6 +87,7 @@ struct dpu_bts_win_config {
 	u32 dst_h;
 	bool is_rot;
 	bool is_comp;
+	bool is_secure;
 	int dpp_ch;
 	u32 format;
 	u64 comp_src;
@@ -114,9 +115,15 @@ struct bts_dpp_info {
 struct bts_decon_info {
 	struct bts_dpp_info rdma[MAX_WIN_PER_DECON];
 	struct bts_dpp_info odma;
+	struct bts_dpp_info rcddma;
 	u32 vclk; /* Khz */
 	u32 lcd_w;
 	u32 lcd_h;
+};
+
+struct decon_win_config {
+	struct dpu_bts_win_config win;
+	dma_addr_t dma_addr;
 };
 
 struct dpu_bts {
@@ -168,6 +175,7 @@ struct dpu_bts {
 
 	struct dpu_bts_win_config win_config[MAX_WIN_PER_DECON];
 	struct dpu_bts_win_config wb_config;
+	struct decon_win_config rcd_win_config;
 	atomic_t delayed_update;
 };
 
@@ -260,11 +268,11 @@ enum dpu_event_type {
 };
 
 enum dpu_event_condition {
-	DPU_EVT_CONDITION_ALL = 0,
-	DPU_EVT_CONDITION_UNDERRUN,
-	DPU_EVT_CONDITION_FAIL_UPDATE_BW,
-	DPU_EVT_CONDITION_FIFO_TIMEOUT,
-	DPU_EVT_CONDITION_IDMA_ERROR,
+	DPU_EVT_CONDITION_DEFAULT		= 1U << 0,
+	DPU_EVT_CONDITION_UNDERRUN		= 1U << 1,
+	DPU_EVT_CONDITION_FAIL_UPDATE_BW	= 1U << 2,
+	DPU_EVT_CONDITION_FIFO_TIMEOUT		= 1U << 3,
+	DPU_EVT_CONDITION_IDMA_ERROR		= 1U << 4,
 };
 
 #define DPU_CALLSTACK_MAX 10
@@ -292,13 +300,9 @@ struct dpu_log_rsc_occupancy {
 	u32 rsc_win;
 };
 
-struct decon_win_config {
-	struct dpu_bts_win_config win;
-	dma_addr_t dma_addr;
-};
-
 struct dpu_log_atomic {
 	struct decon_win_config win_config[MAX_WIN_PER_DECON];
+	struct decon_win_config rcd_win_config;
 };
 
 /* Event log structure for DPU power domain status */

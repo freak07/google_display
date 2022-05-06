@@ -35,6 +35,8 @@
 #define PANEL_ID_LEN		7
 #define PANEL_ID_OFFSET		6
 #define PANEL_ID_READ_SIZE	(PANEL_ID_LEN + PANEL_ID_OFFSET)
+#define PANEL_SLSI_DDIC_ID_REG	0xD6
+#define PANEL_SLSI_DDIC_ID_LEN	5
 
 static const char ext_info_regs[] = { 0xDA, 0xDB, 0xDC };
 #define EXT_INFO_SIZE ARRAY_SIZE(ext_info_regs)
@@ -52,6 +54,10 @@ static ssize_t exynos_panel_parse_byte_buf(char *input_str, size_t input_len,
 static int parse_u32_buf(char *src, size_t src_len, u32 *out, size_t out_len);
 static const struct exynos_panel_mode *exynos_panel_get_mode(struct exynos_panel *ctx,
 							     const struct drm_display_mode *mode);
+static void panel_update_local_hbm_locked(struct exynos_panel *ctx, bool enabled);
+static void exynos_panel_check_mipi_sync_timing(struct drm_crtc *crtc,
+					 const struct exynos_panel_mode *current_mode,
+					 struct exynos_panel *ctx);
 
 static inline bool is_backlight_off_state(const struct backlight_device *bl)
 {
@@ -176,6 +182,9 @@ static void exynos_panel_update_te2(struct exynos_panel *ctx)
 		return;
 
 	funcs->update_te2(ctx);
+
+	if (ctx->bl)
+		te2_state_changed(ctx->bl);
 }
 
 static int exynos_panel_parse_gpios(struct exynos_panel *ctx)
@@ -256,7 +265,7 @@ static int exynos_panel_parse_regulators(struct exynos_panel *ctx)
 	return 0;
 }
 
-static int exynos_panel_read_id(struct exynos_panel *ctx)
+int exynos_panel_read_id(struct exynos_panel *ctx)
 {
 	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
 	char buf[PANEL_ID_READ_SIZE];
@@ -274,6 +283,28 @@ static int exynos_panel_read_id(struct exynos_panel *ctx)
 
 	return 0;
 }
+EXPORT_SYMBOL(exynos_panel_read_id);
+
+int exynos_panel_read_ddic_id(struct exynos_panel *ctx)
+{
+	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+	char buf[PANEL_SLSI_DDIC_ID_LEN] = {0};
+	int ret;
+
+	EXYNOS_DCS_BUF_ADD_AND_FLUSH(ctx, 0xF0, 0x5A, 0x5A);
+	ret = mipi_dsi_dcs_read(dsi, PANEL_SLSI_DDIC_ID_REG,
+				buf, PANEL_SLSI_DDIC_ID_LEN);
+	EXYNOS_DCS_BUF_ADD_AND_FLUSH(ctx, 0xF0, 0xA5, 0xA5);
+	if (ret != PANEL_SLSI_DDIC_ID_LEN) {
+		dev_warn(ctx->dev, "Unable to read DDIC id (%d)\n", ret);
+		return ret;
+	}
+
+	exynos_bin2hex(buf, PANEL_SLSI_DDIC_ID_LEN,
+				ctx->panel_id, sizeof(ctx->panel_id));
+	return 0;
+}
+EXPORT_SYMBOL(exynos_panel_read_ddic_id);
 
 static int exynos_panel_read_extinfo(struct exynos_panel *ctx)
 {
@@ -346,13 +377,6 @@ int exynos_panel_init(struct exynos_panel *ctx)
 	if (ctx->initialized)
 		return 0;
 
-	if (funcs && funcs->read_id)
-		ret = funcs->read_id(ctx);
-	else
-		ret = exynos_panel_read_id(ctx);
-	if (ret)
-		return ret;
-
 	ret = exynos_panel_read_extinfo(ctx);
 	if (!ret)
 		ctx->initialized = true;
@@ -372,6 +396,13 @@ int exynos_panel_init(struct exynos_panel *ctx)
 			 "unable to get panel rev, default to latest\n");
 		ctx->panel_rev = PANEL_REV_LATEST;
 	}
+
+	if (funcs && funcs->read_id)
+		ret = funcs->read_id(ctx);
+	else
+		ret = exynos_panel_read_id(ctx);
+	if (ret)
+		return ret;
 
 	if (funcs && funcs->panel_init)
 		funcs->panel_init(ctx);
@@ -399,6 +430,16 @@ void exynos_panel_reset(struct exynos_panel *ctx)
 	exynos_panel_init(ctx);
 }
 EXPORT_SYMBOL(exynos_panel_reset);
+
+static void _exynos_panel_set_vddd_voltage(struct exynos_panel *ctx, bool is_lp)
+{
+	u32 uv = is_lp ? ctx->vddd_lp_uV : ctx->vddd_normal_uV;
+
+	if (!uv || !ctx->vddd)
+		return;
+	if (regulator_set_voltage(ctx->vddd, uv, uv))
+		dev_err(ctx->dev, "failed to set vddd at %u uV\n", uv);
+}
 
 static int _exynos_panel_set_power(struct exynos_panel *ctx, bool on)
 {
@@ -527,6 +568,7 @@ EXPORT_SYMBOL(exynos_panel_set_power);
 static void exynos_panel_handoff(struct exynos_panel *ctx)
 {
 	ctx->enabled = gpiod_get_raw_value(ctx->reset_gpio) > 0;
+	_exynos_panel_set_vddd_voltage(ctx, false);
 	if (ctx->enabled) {
 		dev_info(ctx->dev, "panel enabled at boot\n");
 		ctx->panel_state = PANEL_STATE_HANDOFF;
@@ -632,6 +674,8 @@ int exynos_panel_disable(struct drm_panel *panel)
 	ctx->dimming_on = false;
 	ctx->self_refresh_active = false;
 	ctx->panel_idle_vrefresh = 0;
+	ctx->current_binned_lp = NULL;
+	ctx->cabc_mode = CABC_OFF;
 
 	exynos_panel_func = ctx->desc->exynos_panel_func;
 	if (exynos_panel_func) {
@@ -639,13 +683,6 @@ int exynos_panel_disable(struct drm_panel *panel)
 			ctx->hbm.local_hbm.enabled = false;
 			sysfs_notify(&ctx->bl->dev.kobj, NULL, "local_hbm_mode");
 			cancel_delayed_work_sync(&ctx->hbm.local_hbm.timeout_work);
-		}
-		if (exynos_panel_func->set_hbm_mode) {
-			cancel_work_sync(&ctx->hbm.hbm_work);
-			if (ctx->hbm.commit) {
-				drm_crtc_commit_put(ctx->hbm.commit);
-				ctx->hbm.commit = NULL;
-			}
 		}
 	}
 
@@ -998,8 +1035,7 @@ static ssize_t set_te2_timing(struct exynos_panel *ctx, size_t count,
 	if (!buf_dup)
 		return -ENOMEM;
 
-	type_len = lp_mode ? (ctx->desc->num_binned_lp - 1) :
-			     ctx->desc->num_modes;
+	type_len = exynos_get_te2_type_len(ctx, lp_mode);
 	data_len = parse_u32_buf(buf_dup, count + 1, timing, type_len * 2);
 	if (data_len != type_len * 2) {
 		dev_warn(ctx->dev,
@@ -1012,7 +1048,7 @@ static ssize_t set_te2_timing(struct exynos_panel *ctx, size_t count,
 
 	mutex_lock(&ctx->mode_lock);
 	funcs->configure_te2_edges(ctx, timing, lp_mode);
-	funcs->update_te2(ctx);
+	exynos_panel_update_te2(ctx);
 	mutex_unlock(&ctx->mode_lock);
 
 	kfree(buf_dup);
@@ -1218,6 +1254,36 @@ static ssize_t panel_idle_show(struct device *dev, struct device_attribute *attr
 	return scnprintf(buf, PAGE_SIZE, "%d\n", ctx->panel_idle_enabled);
 }
 
+static ssize_t panel_need_handle_idle_exit_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	const struct mipi_dsi_device *dsi = to_mipi_dsi_device(dev);
+	struct exynos_panel *ctx = mipi_dsi_get_drvdata(dsi);
+	bool idle_handle_exit;
+	int ret;
+
+	ret = kstrtobool(buf, &idle_handle_exit);
+	if (ret) {
+		dev_err(dev, "invalid panel idle handle exit value\n");
+		return ret;
+	}
+
+	mutex_lock(&ctx->mode_lock);
+	ctx->panel_need_handle_idle_exit = idle_handle_exit;
+	mutex_unlock(&ctx->mode_lock);
+
+	return count;
+}
+
+static ssize_t panel_need_handle_idle_exit_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	const struct mipi_dsi_device *dsi = to_mipi_dsi_device(dev);
+	struct exynos_panel *ctx = mipi_dsi_get_drvdata(dsi);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", ctx->panel_need_handle_idle_exit);
+}
+
 static ssize_t min_vrefresh_store(struct device *dev, struct device_attribute *attr,
 				const char *buf, size_t count)
 {
@@ -1312,6 +1378,64 @@ static ssize_t force_power_on_show(struct device *dev, struct device_attribute *
 	return scnprintf(buf, PAGE_SIZE, "%d\n", ctx->force_power_on);
 }
 
+static ssize_t osc2_clk_khz_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	const struct mipi_dsi_device *dsi = to_mipi_dsi_device(dev);
+	struct exynos_panel *ctx = mipi_dsi_get_drvdata(dsi);
+	const struct exynos_panel_funcs *funcs = ctx->desc->exynos_panel_func;
+	unsigned int osc2_clk_khz;
+	int ret;
+
+	if (!is_panel_active(ctx))
+		return -EPERM;
+
+	if (!funcs || !funcs->set_osc2_clk_khz)
+		return -EOPNOTSUPP;
+
+	ret = kstrtou32(buf, 0, &osc2_clk_khz);
+	if (ret) {
+		dev_err(dev, "invalid osc2 clock value\n");
+		return ret;
+	}
+
+	mutex_lock(&ctx->mode_lock);
+	if (osc2_clk_khz != ctx->osc2_clk_khz)
+		funcs->set_osc2_clk_khz(ctx, osc2_clk_khz);
+	mutex_unlock(&ctx->mode_lock);
+
+	return count;
+}
+
+static ssize_t osc2_clk_khz_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	const struct mipi_dsi_device *dsi = to_mipi_dsi_device(dev);
+	struct exynos_panel *ctx = mipi_dsi_get_drvdata(dsi);
+
+	if (!is_panel_active(ctx))
+		return -EPERM;
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", ctx->osc2_clk_khz);
+}
+
+static ssize_t available_osc2_clk_khz_show(struct device *dev, struct device_attribute *attr,
+					   char *buf)
+{
+	const struct mipi_dsi_device *dsi = to_mipi_dsi_device(dev);
+	struct exynos_panel *ctx = mipi_dsi_get_drvdata(dsi);
+	const struct exynos_panel_funcs *funcs = ctx->desc->exynos_panel_func;
+	ssize_t len;
+
+	if (!funcs || !funcs->list_osc2_clk_khz)
+		return -EPERM;
+
+	len = funcs->list_osc2_clk_khz(ctx, buf);
+	if (len < 0)
+		dev_err(dev, "failed to list OSC2 clocks (%ld)\n", len);
+
+	return len;
+}
+
 static DEVICE_ATTR_RO(serial_number);
 static DEVICE_ATTR_RO(panel_extinfo);
 static DEVICE_ATTR_RO(panel_name);
@@ -1319,9 +1443,12 @@ static DEVICE_ATTR_WO(gamma);
 static DEVICE_ATTR_RW(te2_timing);
 static DEVICE_ATTR_RW(te2_lp_timing);
 static DEVICE_ATTR_RW(panel_idle);
+static DEVICE_ATTR_RW(panel_need_handle_idle_exit);
 static DEVICE_ATTR_RW(min_vrefresh);
 static DEVICE_ATTR_RW(idle_delay_ms);
 static DEVICE_ATTR_RW(force_power_on);
+static DEVICE_ATTR_RW(osc2_clk_khz);
+static DEVICE_ATTR_RO(available_osc2_clk_khz);
 
 static const struct attribute *panel_attrs[] = {
 	&dev_attr_serial_number.attr,
@@ -1331,9 +1458,12 @@ static const struct attribute *panel_attrs[] = {
 	&dev_attr_te2_timing.attr,
 	&dev_attr_te2_lp_timing.attr,
 	&dev_attr_panel_idle.attr,
+	&dev_attr_panel_need_handle_idle_exit.attr,
 	&dev_attr_min_vrefresh.attr,
 	&dev_attr_idle_delay_ms.attr,
 	&dev_attr_force_power_on.attr,
+	&dev_attr_osc2_clk_khz.attr,
+	&dev_attr_available_osc2_clk_khz.attr,
 	NULL
 };
 
@@ -1473,11 +1603,11 @@ static int exynos_panel_connector_get_property(
 	} else if (property == p->dimming_on) {
 		*val = exynos_state->dimming_on;
 		dev_dbg(ctx->dev, "%s: dimming_on(%s)\n", __func__, *val ? "true" : "false");
-	} else if (property == p->sync_rr_switch) {
-		*val = exynos_state->sync_rr_switch;
-		dev_dbg(ctx->dev, "%s: sync_rr_switch(%s)\n", __func__, *val ? "true" : "false");
 	} else if (property == p->lp_mode) {
 		return exynos_panel_get_lp_mode(exynos_connector, exynos_state, val);
+	} else if (property == p->mipi_sync) {
+		*val = exynos_state->mipi_sync;
+		dev_dbg(ctx->dev, "%s: mipi_sync(0x%llx)\n", __func__, *val);
 	} else
 		return -EINVAL;
 
@@ -1513,10 +1643,9 @@ static int exynos_panel_connector_set_property(
 		exynos_state->dimming_on = val;
 		dev_dbg(ctx->dev, "%s: dimming_on(%s)\n", __func__,
 			 exynos_state->dimming_on ? "true" : "false");
-	} else if (property == p->sync_rr_switch) {
-		exynos_state->sync_rr_switch = val;
-		dev_dbg(ctx->dev, "%s: sync_rr_switch(%s)\n", __func__,
-			 exynos_state->sync_rr_switch ? "true" : "false");
+	} else if (property == p->mipi_sync) {
+		exynos_state->mipi_sync = val;
+		dev_dbg(ctx->dev, "%s: mipi_sync(0x%lx)\n", __func__, exynos_state->mipi_sync);
 	} else
 		return -EINVAL;
 
@@ -1544,86 +1673,114 @@ static void exynos_panel_set_dimming(struct exynos_panel *ctx, bool dimming_on)
 	mutex_unlock(&ctx->mode_lock);
 }
 
-static void exynos_panel_commit_properties(
+static void exynos_panel_set_cabc(struct exynos_panel *ctx, enum exynos_cabc_mode cabc_mode)
+{
+	const struct exynos_panel_funcs *funcs = ctx->desc->exynos_panel_func;
+
+	if (!funcs || !funcs->set_cabc_mode)
+		return;
+
+	mutex_lock(&ctx->mode_lock);
+	if (cabc_mode != ctx->cabc_mode)
+		funcs->set_cabc_mode(ctx, cabc_mode);
+
+	mutex_unlock(&ctx->mode_lock);
+}
+
+static void exynos_panel_pre_commit_properties(
 				struct exynos_panel *ctx,
 				const struct exynos_drm_connector_state *conn_state)
 {
 	const struct exynos_panel_funcs *exynos_panel_func = ctx->desc->exynos_panel_func;
-	u8 update_flags = 0;
+	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+	bool mipi_sync;
+	bool ghbm_updated = false;
 
 	if (!conn_state->pending_update_flags)
 		return;
 
-	if (exynos_panel_func->set_hbm_mode ||
-		exynos_panel_func->set_local_hbm_mode) {
-		cancel_work_sync(&ctx->hbm.hbm_work);
-		mutex_lock(&ctx->hbm.hbm_work_lock);
-		update_flags = ctx->hbm.update_flags;
-		ctx->hbm.update_flags = 0;
-		mutex_unlock(&ctx->hbm.hbm_work_lock);
+	DPU_ATRACE_BEGIN(__func__);
+	mipi_sync = conn_state->mipi_sync &
+		(MIPI_CMD_SYNC_LHBM | MIPI_CMD_SYNC_GHBM | MIPI_CMD_SYNC_BL);
+
+	if (mipi_sync) {
+		exynos_panel_check_mipi_sync_timing(conn_state->base.crtc,
+						    ctx->current_mode, ctx);
+		exynos_dsi_dcs_write_buffer_force_batch_begin(dsi);
 	}
 
 	if ((conn_state->pending_update_flags & HBM_FLAG_GHBM_UPDATE) &&
-		exynos_panel_func->set_hbm_mode &&
-		(ctx->hbm_mode != conn_state->global_hbm_mode))
-		update_flags |= HBM_FLAG_GHBM_UPDATE;
+		exynos_panel_func && exynos_panel_func->set_hbm_mode &&
+		(ctx->hbm_mode != conn_state->global_hbm_mode)) {
+		DPU_ATRACE_BEGIN("set_hbm");
+		mutex_lock(&ctx->mode_lock);
+		exynos_panel_func->set_hbm_mode(ctx, conn_state->global_hbm_mode);
+		backlight_state_changed(ctx->bl);
+		mutex_unlock(&ctx->mode_lock);
+		DPU_ATRACE_END("set_hbm");
+		ghbm_updated = true;
+	}
 
 	if ((conn_state->pending_update_flags & HBM_FLAG_BL_UPDATE) &&
-		(ctx->bl->props.brightness != conn_state->brightness_level))
-		update_flags |= HBM_FLAG_BL_UPDATE;
-
-	if ((conn_state->pending_update_flags & HBM_FLAG_LHBM_UPDATE) &&
-		exynos_panel_func->set_local_hbm_mode &&
-		(ctx->hbm.local_hbm.enabled != conn_state->local_hbm_on))
-		update_flags |= HBM_FLAG_LHBM_UPDATE;
-
-	if ((conn_state->pending_update_flags & HBM_FLAG_DIMMING_UPDATE) &&
-		exynos_panel_func->set_dimming_on &&
-		(ctx->dimming_on != conn_state->dimming_on))
-		update_flags |= HBM_FLAG_DIMMING_UPDATE;
-
-	dev_dbg(ctx->dev, "%s: update_flags(0x%x)", __func__, update_flags);
-	if (update_flags & (HBM_FLAG_GHBM_UPDATE | HBM_FLAG_LHBM_UPDATE)) {
-		struct drm_crtc_commit *commit = conn_state->base.commit;
-		struct drm_crtc_commit *old_commit;
-
-		if (commit)
-			drm_crtc_commit_get(commit);
-
-		mutex_lock(&ctx->hbm.hbm_work_lock);
-		old_commit = ctx->hbm.commit;
-		if (WARN_ON(old_commit))
-			drm_crtc_commit_put(old_commit);
-
-		ctx->hbm.commit = commit;
-
-		if (update_flags & HBM_FLAG_GHBM_UPDATE)
-			ctx->hbm.request_global_hbm_mode = conn_state->global_hbm_mode;
-
-		if (update_flags & HBM_FLAG_BL_UPDATE)
-			ctx->bl->props.brightness = conn_state->brightness_level;
-
-		if (update_flags & HBM_FLAG_LHBM_UPDATE)
-			ctx->hbm.local_hbm.request_hbm_mode = conn_state->local_hbm_on;
-
-		if (update_flags & HBM_FLAG_DIMMING_UPDATE)
-			ctx->request_dimming_on = conn_state->dimming_on;
-
-		ctx->hbm.update_flags = update_flags;
-		update_flags = 0;
-		queue_work(system_highpri_wq, &ctx->hbm.hbm_work);
-		mutex_unlock(&ctx->hbm.hbm_work_lock);
-	}
-
-	if (update_flags & HBM_FLAG_BL_UPDATE) {
+		(ctx->bl->props.brightness != conn_state->brightness_level)) {
+		DPU_ATRACE_BEGIN("set_bl");
 		ctx->bl->props.brightness = conn_state->brightness_level;
 		backlight_update_status(ctx->bl);
+		DPU_ATRACE_END("set_bl");
 	}
 
+	if ((conn_state->pending_update_flags & HBM_FLAG_LHBM_UPDATE) &&
+		exynos_panel_func && exynos_panel_func->set_local_hbm_mode &&
+		(ctx->hbm.local_hbm.enabled != conn_state->local_hbm_on)) {
+		DPU_ATRACE_BEGIN("set_lhbm");
+		dev_info(ctx->dev, "%s: set LHBM to %d\n", __func__,
+			conn_state->local_hbm_on);
+		mutex_lock(&ctx->mode_lock);
+		panel_update_local_hbm_locked(ctx, conn_state->local_hbm_on);
+		mutex_unlock(&ctx->mode_lock);
+		DPU_ATRACE_END("set_lhbm");
+	}
 
-	if (update_flags & HBM_FLAG_DIMMING_UPDATE)
+	if ((conn_state->pending_update_flags & HBM_FLAG_DIMMING_UPDATE) &&
+		exynos_panel_func && exynos_panel_func->set_dimming_on &&
+		(ctx->dimming_on != conn_state->dimming_on)) {
+		DPU_ATRACE_BEGIN("set_dimming");
 		exynos_panel_set_dimming(ctx, conn_state->dimming_on);
+		DPU_ATRACE_END("set_dimming");
+	}
 
+	if (mipi_sync)
+		exynos_dsi_dcs_write_buffer_force_batch_end(dsi);
+
+	if ((MIPI_CMD_SYNC_GHBM & conn_state->mipi_sync)) {
+		/**
+		 * panel needs one extra VSYNC period to apply GHBM. The frame
+		 * update should be delayed.
+		 */
+		DPU_ATRACE_BEGIN("ghbm_wait");
+		if (!drm_crtc_vblank_get(conn_state->base.crtc)) {
+			drm_crtc_wait_one_vblank(conn_state->base.crtc);
+			drm_crtc_vblank_put(conn_state->base.crtc);
+		} else {
+			pr_warn("%s failed to get vblank for ghbm wait\n", __func__);
+		}
+		DPU_ATRACE_END("ghbm_wait");
+	}
+
+	if (ghbm_updated)
+		sysfs_notify(&ctx->bl->dev.kobj, NULL, "hbm_mode");
+
+	DPU_ATRACE_END(__func__);
+}
+
+static void exynos_panel_connector_atomic_pre_commit(
+				struct exynos_drm_connector *exynos_connector,
+			    struct exynos_drm_connector_state *exynos_old_state,
+			    struct exynos_drm_connector_state *exynos_new_state)
+{
+	struct exynos_panel *ctx = exynos_connector_to_panel(exynos_connector);
+
+	exynos_panel_pre_commit_properties(ctx, exynos_new_state);
 }
 
 static void exynos_panel_connector_atomic_commit(
@@ -1637,8 +1794,6 @@ static void exynos_panel_connector_atomic_commit(
 	if (!exynos_panel_func)
 		return;
 
-	exynos_panel_commit_properties(ctx, exynos_new_state);
-
 	mutex_lock(&ctx->mode_lock);
 	if (exynos_panel_func->commit_done)
 		exynos_panel_func->commit_done(ctx);
@@ -1648,6 +1803,7 @@ static void exynos_panel_connector_atomic_commit(
 }
 
 static const struct exynos_drm_connector_helper_funcs exynos_panel_connector_helper_funcs = {
+	.atomic_pre_commit = exynos_panel_connector_atomic_pre_commit,
 	.atomic_commit = exynos_panel_connector_atomic_commit,
 };
 
@@ -1748,18 +1904,24 @@ static void exynos_panel_set_partial(struct exynos_display_partial *partial,
 
 static int exynos_drm_connector_check_mode(struct exynos_panel *ctx,
 					   struct drm_connector_state *connector_state,
-					   const struct drm_display_mode *mode)
+					   struct drm_crtc_state *crtc_state)
 {
 	struct exynos_drm_connector_state *exynos_connector_state =
 		to_exynos_connector_state(connector_state);
-	const struct exynos_panel_mode *pmode = exynos_panel_get_mode(ctx, mode);
+	const struct exynos_panel_mode *pmode =
+		exynos_panel_get_mode(ctx, &crtc_state->mode);
 
 	if (!pmode) {
-		dev_warn(ctx->dev, "invalid mode %s\n", mode->name);
+		dev_warn(ctx->dev, "invalid mode %s\n", pmode->mode.name);
 		return -EINVAL;
 	}
 
-	exynos_connector_state->seamless_possible = exynos_panel_is_mode_seamless(ctx, pmode);
+	if (crtc_state->connectors_changed || !is_panel_active(ctx))
+		exynos_connector_state->seamless_possible = false;
+	else
+		exynos_connector_state->seamless_possible =
+			exynos_panel_is_mode_seamless(ctx, pmode);
+
 	exynos_connector_state->exynos_mode = pmode->exynos_mode;
 	exynos_panel_set_partial(&exynos_connector_state->partial, pmode,
 			ctx->desc->is_partial);
@@ -1946,7 +2108,9 @@ ssize_t exynos_dsi_dcs_write_buffer(struct mipi_dsi_device *dsi,
 
 	switch (len) {
 	case 0:
-		return -EINVAL;
+		/* allow flag only messages to dsim */
+		type = 0;
+		break;
 
 	case 1:
 		type = MIPI_DSI_DCS_SHORT_WRITE;
@@ -2358,6 +2522,59 @@ static ssize_t hbm_mode_show(struct device *dev,
 
 static DEVICE_ATTR_RW(hbm_mode);
 
+static ssize_t cabc_mode_store(struct device *dev, struct device_attribute *attr, const char *buf,
+			       size_t count)
+{
+	struct backlight_device *bd = to_backlight_device(dev);
+	struct exynos_panel *ctx = bl_get_data(bd);
+	u32 cabc_mode;
+	int ret;
+
+	if (!is_panel_active(ctx)) {
+		dev_err(ctx->dev, "panel is not enabled\n");
+		return -EPERM;
+	}
+
+	ret = kstrtouint(buf, 0, &cabc_mode);
+	if (ret || (cabc_mode > CABC_MOVIE_MODE)) {
+		dev_err(ctx->dev, "invalid cabc_mode value");
+		return -EINVAL;
+	}
+
+	exynos_panel_set_cabc(ctx, cabc_mode);
+
+	return count;
+}
+
+static ssize_t cabc_mode_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct backlight_device *bd = to_backlight_device(dev);
+	struct exynos_panel *ctx = bl_get_data(bd);
+	const char *mode;
+
+	switch (ctx->cabc_mode) {
+	case CABC_OFF:
+		mode = "OFF";
+		break;
+	case CABC_UI_MODE:
+		mode = "UI";
+		break;
+	case CABC_STILL_MODE:
+		mode = "STILL";
+		break;
+	case CABC_MOVIE_MODE:
+		mode = "MOVIE";
+		break;
+	default:
+		dev_err(ctx->dev, "unknown CABC mode : %d\n", ctx->cabc_mode);
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%s\n", mode);
+}
+
+static DEVICE_ATTR_RW(cabc_mode);
+
 static ssize_t dimming_on_store(struct device *dev,
 			       struct device_attribute *attr,
 			       const char *buf, size_t count)
@@ -2576,6 +2793,41 @@ static ssize_t lp_state_show(struct device *dev,
 
 static DEVICE_ATTR_RO(lp_state);
 
+static ssize_t te2_state_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct backlight_device *bl = to_backlight_device(dev);
+	struct exynos_panel *ctx = bl_get_data(bl);
+	const struct exynos_panel_mode *pmode;
+	int rc = 0;
+
+	if (!is_panel_active(ctx))
+		return -EPERM;
+
+	mutex_lock(&ctx->mode_lock);
+	pmode = ctx->current_mode;
+	mutex_unlock(&ctx->mode_lock);
+	if (pmode) {
+		bool fixed = ctx->te2.option == TE2_OPT_FIXED;
+		bool lp_mode = pmode->exynos_mode.is_lp_mode;
+		int vrefresh;
+
+		if (fixed)
+			vrefresh = lp_mode ? FIXED_TE2_VREFRESH_LP : FIXED_TE2_VREFRESH_NORMAL;
+		else
+			vrefresh = exynos_get_actual_vrefresh(ctx);
+
+		rc = scnprintf(buf, PAGE_SIZE, "%s-te2@%d\n",
+			       fixed ? "fixed" : "changeable", vrefresh);
+	}
+
+	dev_dbg(ctx->dev, "%s: %s\n", __func__, rc > 0 ? buf : "");
+
+	return rc;
+}
+
+static DEVICE_ATTR_RO(te2_state);
+
 static int parse_u32_buf(char *src, size_t src_len, u32 *out, size_t out_len)
 {
 	int rc = 0, cnt = 0;
@@ -2685,6 +2937,7 @@ static struct attribute *bl_device_attrs[] = {
 	&dev_attr_local_hbm_max_timeout.attr,
 	&dev_attr_state.attr,
 	&dev_attr_lp_state.attr,
+	&dev_attr_te2_state.attr,
 	&dev_attr_als_table.attr,
 	NULL,
 };
@@ -2719,6 +2972,8 @@ static unsigned long get_backlight_state_from_panel(struct backlight_device *bl,
 	case PANEL_STATE_LP:
 		state &= ~(BL_STATE_STANDBY);
 		state |= BL_STATE_LP;
+		break;
+	case PANEL_STATE_MODESET: /* no change */
 		break;
 	case PANEL_STATE_OFF:
 	case PANEL_STATE_BLANK:
@@ -2770,10 +3025,10 @@ static int exynos_panel_attach_properties(struct exynos_panel *ctx)
 	drm_object_attach_property(obj, p->global_hbm_mode, 0);
 	drm_object_attach_property(obj, p->local_hbm_on, 0);
 	drm_object_attach_property(obj, p->dimming_on, 0);
-	drm_object_attach_property(obj, p->sync_rr_switch, 0);
+	drm_object_attach_property(obj, p->mipi_sync, 0);
 	drm_object_attach_property(obj, p->is_partial, desc->is_partial);
 	drm_object_attach_property(obj, p->panel_idle_support, desc->is_panel_idle_supported);
-
+	drm_object_attach_property(obj, p->panel_orientation, ctx->orientation);
 
 	if (desc->brt_capability) {
 		ret = exynos_panel_attach_brightness_capability(&ctx->exynos_connector,
@@ -2825,8 +3080,6 @@ static int exynos_panel_bridge_attach(struct drm_bridge *bridge,
 		dev_err(ctx->dev, "failed to attach connector properties\n");
 		return ret;
 	}
-	if (drm_connector_set_panel_orientation(connector, ctx->orientation))
-		dev_warn(ctx->dev, "failed to set panel orientation %u\n", ctx->orientation);
 
 	drm_connector_helper_add(connector, &exynos_connector_helper_funcs);
 
@@ -2880,31 +3133,37 @@ static void exynos_panel_bridge_enable(struct drm_bridge *bridge,
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 	bool need_update_backlight = false;
 	bool is_active;
+	const bool is_lp_mode = ctx->current_mode &&
+				ctx->current_mode->exynos_mode.is_lp_mode;
 
 	mutex_lock(&ctx->mode_lock);
-	if (ctx->panel_state == PANEL_STATE_HANDOFF)
+	if (ctx->panel_state == PANEL_STATE_HANDOFF) {
 		is_active = !exynos_panel_init(ctx);
-	else
+	} else if (ctx->panel_state == PANEL_STATE_HANDOFF_MODESET) {
+		if (!exynos_panel_init(ctx)) {
+			ctx->panel_state = PANEL_STATE_MODESET;
+			mutex_unlock(&ctx->mode_lock);
+			drm_panel_disable(&ctx->panel);
+			mutex_lock(&ctx->mode_lock);
+		}
+		is_active = false;
+	} else {
 		is_active = is_panel_active(ctx);
+	}
 
 	/* avoid turning on panel again if already enabled (ex. while booting or self refresh) */
 	if (!is_active) {
 		drm_panel_enable(&ctx->panel);
 		need_update_backlight = true;
 	}
+	ctx->panel_state = is_lp_mode ? PANEL_STATE_LP : PANEL_STATE_NORMAL;
 
 	if (ctx->self_refresh_active) {
 		dev_dbg(ctx->dev, "self refresh state : %s\n", __func__);
 
 		ctx->self_refresh_active = false;
-		ctx->panel_state = PANEL_STATE_NORMAL;
 		panel_update_idle_mode_locked(ctx);
 	} else {
-		const bool is_lp_mode = ctx->current_mode &&
-					ctx->current_mode->exynos_mode.is_lp_mode;
-
-		ctx->panel_state = is_lp_mode ? PANEL_STATE_LP : PANEL_STATE_NORMAL;
-
 		exynos_panel_set_backlight_state(ctx, ctx->panel_state);
 
 		/* For the case of OFF->AOD, TE2 will be updated in backlight_update_status */
@@ -2951,7 +3210,7 @@ static int exynos_panel_bridge_atomic_check(struct drm_bridge *bridge,
 			old_crtc_state->self_refresh_active = true;
 	}
 
-	return exynos_drm_connector_check_mode(ctx, conn_state, &new_crtc_state->mode);
+	return exynos_drm_connector_check_mode(ctx, conn_state, new_crtc_state);
 }
 
 static void exynos_panel_bridge_pre_enable(struct drm_bridge *bridge,
@@ -2959,15 +3218,12 @@ static void exynos_panel_bridge_pre_enable(struct drm_bridge *bridge,
 {
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 
-	if (is_panel_active(ctx) || (ctx->panel_state == PANEL_STATE_HANDOFF))
-		return;
-
 	if (ctx->panel_state == PANEL_STATE_BLANK) {
 		const struct exynos_panel_funcs *funcs = ctx->desc->exynos_panel_func;
 
 		if (funcs && funcs->panel_reset)
 			funcs->panel_reset(ctx);
-	} else {
+	} else if (!is_panel_enabled(ctx)) {
 		drm_panel_prepare(&ctx->panel);
 	}
 }
@@ -2988,9 +3244,10 @@ static void exynos_panel_bridge_disable(struct drm_bridge *bridge,
 		panel_update_idle_mode_locked(ctx);
 		mutex_unlock(&ctx->mode_lock);
 	} else {
-		if ((crtc_state && crtc_state->mode_changed &&
-		    drm_atomic_crtc_effectively_active(crtc_state)) ||
-		    ctx->force_power_on)
+		if (crtc_state && crtc_state->mode_changed &&
+		    drm_atomic_crtc_effectively_active(crtc_state))
+			ctx->panel_state = PANEL_STATE_MODESET;
+		else if (ctx->force_power_on)
 			ctx->panel_state = PANEL_STATE_BLANK;
 		else
 			ctx->panel_state = PANEL_STATE_OFF;
@@ -3005,32 +3262,38 @@ static void exynos_panel_bridge_post_disable(struct drm_bridge *bridge,
 	struct exynos_panel *ctx = bridge_to_exynos_panel(bridge);
 
 	/* fully power off only if panel is in full off mode */
-	if (ctx->panel_state == PANEL_STATE_OFF)
+	if (!is_panel_enabled(ctx))
 		drm_panel_unprepare(&ctx->panel);
 
 	exynos_panel_set_backlight_state(ctx, ctx->panel_state);
 }
 
 /* Get the VSYNC start time within a TE period */
-static u64 exynos_panel_vsync_start_time_us(u32 te_period_us)
+static u64 exynos_panel_vsync_start_time_us(u32 te_us, u32 te_period_us)
 {
-	/* Approximate the VSYNC start time with TE falling edge. Approximate
-	 * the TE falling edge with 55% TE width
-	 */
-	/* TODO: Change to ctx->current_mode->exynos_mode.vblank_usec when it's accurate */
+	/* Approximate the VSYNC start time with TE falling edge. */
+	if (te_us > 0 && te_us < te_period_us)
+		return te_us * 105 / 100; /* add 5% for variation */
+
+	/* Approximate the TE falling edge with 55% TE width */
 	return te_period_us * 55 / 100;
 }
 
-static void exynos_panel_check_modeset_timing(struct drm_crtc *crtc,
-					 const struct drm_display_mode *old_mode)
+static void exynos_panel_check_mipi_sync_timing(struct drm_crtc *crtc,
+						const struct exynos_panel_mode *current_mode,
+						struct exynos_panel *ctx)
 {
 	u32 te_period_us;
 	int retry;
 	u64 left, right;
+	bool vblank_taken = false;
 
-	DPU_ATRACE_BEGIN(__func__);
-	pr_debug("%s: check mode_set timing enter.\n", __func__);
-	te_period_us = USEC_PER_SEC / drm_mode_vrefresh(old_mode);
+	if (WARN_ON(!current_mode))
+		return;
+
+	DPU_ATRACE_BEGIN("mipi_time_window");
+	te_period_us = USEC_PER_SEC / drm_mode_vrefresh(&current_mode->mode);
+	pr_debug("%s: check mode_set timing enter. te %d\n", __func__, te_period_us);
 
 	/*
 	 * Safe time window to send RR (refresh rate) command illustrated below. RR switch
@@ -3052,7 +3315,7 @@ static void exynos_panel_check_modeset_timing(struct drm_crtc *crtc,
 	 * VSYNC------+----------+-------+----
 	 *            RR1        RR2
 	 */
-	left = exynos_panel_vsync_start_time_us(te_period_us);
+	left = exynos_panel_vsync_start_time_us(current_mode->exynos_mode.te_usec, te_period_us);
 	right = te_period_us - USEC_PER_MSEC;
 	/* check for next TE every 1ms */
 	retry = te_period_us / USEC_PER_MSEC + 1;
@@ -3060,15 +3323,56 @@ static void exynos_panel_check_modeset_timing(struct drm_crtc *crtc,
 	do {
 		ktime_t last_te = 0, now;
 		s64 since_last_te_us;
+		s64 rr_switch_delta_us;
+		s64 te_period_before_rr_switch_us;
 
 		drm_crtc_vblank_count_and_time(crtc, &last_te);
 		now = ktime_get();
 		since_last_te_us = ktime_us_delta(now, last_te);
+		/* Need a vblank as a reference point */
+		if (since_last_te_us > te_period_us) {
+			DPU_ATRACE_BEGIN("time_window_wait_crtc");
+			if (vblank_taken || !drm_crtc_vblank_get(crtc)) {
+				drm_crtc_wait_one_vblank(crtc);
+				vblank_taken = true;
+			} else {
+				pr_warn("%s failed to get vblank for ref point.\n", __func__);
+			}
+			DPU_ATRACE_END("time_window_wait_crtc");
+			continue;
+		}
+
+		/**
+		 * If a refresh rate switch happens right before last_te. last_te is not reliable
+		 * because it could be for the new refresh rate or the old refresh rate.
+		 * Wait another vblank in this case.
+		 */
+		rr_switch_delta_us = ktime_us_delta(last_te, ctx->last_rr_switch_ts);
+		te_period_before_rr_switch_us = ctx->last_rr != 0 ? USEC_PER_SEC / ctx->last_rr : 0;
+		if (rr_switch_delta_us > 0 && rr_switch_delta_us < te_period_before_rr_switch_us) {
+			DPU_ATRACE_BEGIN("time_window_wait_crtc2");
+			if (vblank_taken || !drm_crtc_vblank_get(crtc)) {
+				drm_crtc_wait_one_vblank(crtc);
+				vblank_taken = true;
+			} else {
+				pr_warn("%s failed to get vblank for rr wait\n", __func__);
+			}
+			DPU_ATRACE_END("time_window_wait_crtc2");
+			continue;
+		}
+
 		if (since_last_te_us <= right) {
 			if (since_last_te_us < left) {
 				u32 delay_us = left - since_last_te_us;
 
+				DPU_ATRACE_BEGIN("time_window_wait");
 				usleep_range(delay_us, delay_us + 100);
+				DPU_ATRACE_END("time_window_wait");
+				/*
+				 * if a mode switch happens, a TE signal might
+				 * happen during the sleep. need to re-sync
+				 */
+				continue;
 			}
 			break;
 		}
@@ -3076,8 +3380,11 @@ static void exynos_panel_check_modeset_timing(struct drm_crtc *crtc,
 		usleep_range(USEC_PER_MSEC, USEC_PER_MSEC + 100);
 	} while (--retry > 0);
 
+	if (vblank_taken)
+		drm_crtc_vblank_put(crtc);
+
 	pr_debug("%s: check mode_set timing exit.\n", __func__);
-	DPU_ATRACE_END(__func__);
+	DPU_ATRACE_END("mipi_time_window");
 }
 
 static void panel_update_local_hbm_locked(struct exynos_panel *ctx, bool enabled)
@@ -3108,30 +3415,23 @@ static void exynos_panel_bridge_mode_set(struct drm_bridge *bridge,
 				      to_exynos_connector_state(connector_state);
 	const struct exynos_panel_mode *pmode = exynos_panel_get_mode(ctx, mode);
 	const struct exynos_panel_funcs *funcs = ctx->desc->exynos_panel_func;
-	const struct exynos_panel_mode *current_mode;
+	const struct exynos_panel_mode *old_mode;
 	bool need_update_backlight = false;
 
 	if (WARN_ON(!pmode))
 		return;
 
 	mutex_lock(&ctx->mode_lock);
-	current_mode = ctx->current_mode;
+	old_mode = ctx->current_mode;
 
-	if (current_mode == pmode) {
+	if (old_mode == pmode) {
 		mutex_unlock(&ctx->mode_lock);
 		return;
 	}
 
 	if (ctx->panel_state == PANEL_STATE_HANDOFF) {
-		WARN(1, "mode change at boot to %s\n", adjusted_mode->name);
-
-		/*
-		 * This is unexpected, but the best we can do is to set as disable which will
-		 * force panel reset on next enable. That way it will go into new mode
-		 */
-		ctx->enabled = false;
-		ctx->panel_state = PANEL_STATE_UNINITIALIZED;
-		exynos_panel_set_power(ctx, false);
+		dev_warn(ctx->dev, "mode change at boot to %s\n", adjusted_mode->name);
+		ctx->panel_state = PANEL_STATE_HANDOFF_MODESET;
 	}
 
 	dev_dbg(ctx->dev, "changing display mode to %dx%d@%d\n",
@@ -3143,8 +3443,7 @@ static void exynos_panel_bridge_mode_set(struct drm_bridge *bridge,
 	DPU_ATRACE_BEGIN(__func__);
 	if (funcs) {
 		const bool is_active = is_panel_active(ctx);
-		const bool was_lp_mode = current_mode &&
-					 current_mode->exynos_mode.is_lp_mode;
+		const bool was_lp_mode = old_mode && old_mode->exynos_mode.is_lp_mode;
 		const bool is_lp_mode = pmode->exynos_mode.is_lp_mode;
 		bool state_changed = false;
 
@@ -3157,22 +3456,23 @@ static void exynos_panel_bridge_mode_set(struct drm_bridge *bridge,
 					panel_update_local_hbm_locked(ctx, false);
 				}
 				funcs->set_lp_mode(ctx, pmode);
+				ctx->panel_state = PANEL_STATE_LP;
 				need_update_backlight = true;
 			}
-			if (ctx->vddd && ctx->vddd_lp_uV)
-				regulator_set_voltage(ctx->vddd, ctx->vddd_lp_uV, ctx->vddd_lp_uV);
-		} else if (was_lp_mode && !is_lp_mode && funcs->set_nolp_mode) {
-			if (ctx->vddd && ctx->vddd_normal_uV)
-				regulator_set_voltage(ctx->vddd, ctx->vddd_normal_uV,
-						      ctx->vddd_normal_uV);
-			if (is_active) {
+			_exynos_panel_set_vddd_voltage(ctx, true);
+		} else if (was_lp_mode && !is_lp_mode) {
+			_exynos_panel_set_vddd_voltage(ctx, false);
+			if (is_active && funcs->set_nolp_mode) {
 				funcs->set_nolp_mode(ctx, pmode);
+				ctx->panel_state = PANEL_STATE_NORMAL;
 				need_update_backlight = true;
 				state_changed = true;
 			}
+			ctx->current_binned_lp = NULL;
 		} else if (funcs->mode_set) {
-			if (exynos_connector_state->sync_rr_switch && is_active)
-				exynos_panel_check_modeset_timing(crtc, &current_mode->mode);
+			if ((MIPI_CMD_SYNC_REFRESH_RATE & exynos_connector_state->mipi_sync) &&
+					is_active && old_mode)
+				exynos_panel_check_mipi_sync_timing(crtc, old_mode, ctx);
 			funcs->mode_set(ctx, pmode);
 			state_changed = is_active;
 		}
@@ -3191,6 +3491,11 @@ static void exynos_panel_bridge_mode_set(struct drm_bridge *bridge,
 		}
 	} else {
 		ctx->current_mode = pmode;
+	}
+
+	if (old_mode && drm_mode_vrefresh(&pmode->mode) != drm_mode_vrefresh(&old_mode->mode)) {
+		ctx->last_rr_switch_ts = ktime_get();
+		ctx->last_rr = drm_mode_vrefresh(&old_mode->mode);
 	}
 
 	mutex_unlock(&ctx->mode_lock);
@@ -3216,87 +3521,6 @@ static void local_hbm_timeout_work(struct work_struct *work)
 	sysfs_notify(&ctx->bl->dev.kobj, NULL, "local_hbm_mode");
 }
 
-static void hbm_work(struct work_struct *work)
-{
-	struct exynos_panel *ctx =
-			 container_of(work, struct exynos_panel, hbm.hbm_work);
-	const struct exynos_panel_funcs *exynos_panel_func = ctx->desc->exynos_panel_func;
-	struct drm_crtc_commit *commit = ctx->hbm.commit;
-	u32 delay_us, timeout_ms, te_period_us;
-	int fps;
-
-	dev_dbg(ctx->dev, "%s (update_flags: 0x%02x)\n", __func__, ctx->hbm.update_flags);
-
-	mutex_lock(&ctx->mode_lock);
-	fps = drm_mode_vrefresh(&ctx->current_mode->mode);
-	mutex_unlock(&ctx->mode_lock);
-	WARN_ON(fps < 0);
-	if (fps <= 0)
-		fps = 1;
-	te_period_us = USEC_PER_SEC / fps;
-
-	/* delay begins at TE rising, ends at VSYNC rising */
-	delay_us = exynos_panel_vsync_start_time_us(te_period_us);
-	timeout_ms = te_period_us / USEC_PER_MSEC + 20;
-
-	/* considering the variation */
-	delay_us = delay_us * 105 / 100;
-
-	DPU_ATRACE_BEGIN("ghbm");
-	mutex_lock(&ctx->hbm.hbm_work_lock);
-
-	WARN_ON(!commit);
-
-	if (commit) {
-		int ret;
-
-		DPU_ATRACE_BEGIN("wait_for_flip");
-		ctx->hbm.commit = NULL;
-		ret = wait_for_completion_timeout(&commit->flip_done,
-						  msecs_to_jiffies(timeout_ms));
-		WARN_ON(ret < 0);
-		drm_crtc_commit_put(commit);
-		DPU_ATRACE_END("wait_for_flip");
-	}
-
-	usleep_range(delay_us, delay_us + 100);
-	if (ctx->hbm.update_flags & HBM_FLAG_GHBM_UPDATE) {
-		DPU_ATRACE_BEGIN("set_hbm");
-		mutex_lock(&ctx->mode_lock);
-		exynos_panel_func->set_hbm_mode(ctx, ctx->hbm.request_global_hbm_mode);
-		backlight_state_changed(ctx->bl);
-		mutex_unlock(&ctx->mode_lock);
-		DPU_ATRACE_END("set_hbm");
-	}
-
-	if (ctx->hbm.update_flags & HBM_FLAG_BL_UPDATE) {
-		DPU_ATRACE_BEGIN("set_bl");
-		backlight_update_status(ctx->bl);
-		DPU_ATRACE_END("set_bl");
-	}
-
-	if (ctx->hbm.update_flags & HBM_FLAG_LHBM_UPDATE) {
-		DPU_ATRACE_BEGIN("set_lhbm");
-		dev_info(ctx->dev, "%s: set LHBM to %d (%dHz)\n",
-			__func__, ctx->hbm.local_hbm.request_hbm_mode, fps);
-		mutex_lock(&ctx->mode_lock);
-		panel_update_local_hbm_locked(ctx, ctx->hbm.local_hbm.request_hbm_mode);
-		mutex_unlock(&ctx->mode_lock);
-		DPU_ATRACE_END("set_lhbm");
-	}
-
-	if (ctx->hbm.update_flags & HBM_FLAG_DIMMING_UPDATE) {
-		DPU_ATRACE_BEGIN("set_dimming");
-		exynos_panel_set_dimming(ctx, ctx->request_dimming_on);
-		DPU_ATRACE_END("set_dimming");
-	}
-
-	ctx->hbm.update_flags = 0;
-	mutex_unlock(&ctx->hbm.hbm_work_lock);
-
-	DPU_ATRACE_END("hbm");
-}
-
 static void hbm_data_init(struct exynos_panel *ctx)
 {
 	ctx->hbm.local_hbm.gamma_para_ready = false;
@@ -3307,18 +3531,17 @@ static void hbm_data_init(struct exynos_panel *ctx)
 		dev_err(ctx->dev, "failed to create hbm workq!\n");
 	else {
 		INIT_DELAYED_WORK(&ctx->hbm.local_hbm.timeout_work, local_hbm_timeout_work);
-		INIT_WORK(&ctx->hbm.hbm_work, hbm_work);
 	}
-	ctx->hbm.update_flags = 0;
-	mutex_init(&ctx->hbm.hbm_work_lock);
 }
 
 static void exynos_panel_te2_init(struct exynos_panel *ctx)
 {
 	struct te2_mode_data *data;
 	const struct exynos_binned_lp *binned_lp;
-	int i;
+	int i, j;
 	int lp_idx = ctx->desc->num_modes;
+	int lp_mode_count = ctx->desc->lp_mode_count ? : 1;
+	int mode_count = ctx->desc->num_modes + lp_mode_count * (ctx->desc->num_binned_lp - 1);
 
 	for (i = 0; i < ctx->desc->num_modes; i++) {
 		const struct exynos_panel_mode *pmode = &ctx->desc->modes[i];
@@ -3329,19 +3552,34 @@ static void exynos_panel_te2_init(struct exynos_panel *ctx)
 		data->timing.falling_edge = pmode->te2_timing.falling_edge;
 	}
 
-	for_each_exynos_binned_lp(i, binned_lp, ctx) {
-		/* ignore the first binned entry (off) */
-		if (i == 0)
-			continue;
+	for (i = 0; i < lp_mode_count; i++) {
+		int lp_mode_offset = lp_idx + i * (ctx->desc->num_binned_lp - 1);
 
-		data = &ctx->te2.mode_data[i - 1 + lp_idx];
-		data->mode = &ctx->desc->lp_mode->mode;
-		data->binned_lp = binned_lp;
-		data->timing.rising_edge =
-				binned_lp->te2_timing.rising_edge;
-		data->timing.falling_edge =
-				binned_lp->te2_timing.falling_edge;
+		for_each_exynos_binned_lp(j, binned_lp, ctx) {
+			int idx;
+
+			/* ignore the first binned entry (off) */
+			if (j == 0)
+				continue;
+
+			idx = lp_mode_offset + j - 1;
+			if (idx >= mode_count) {
+				dev_warn(ctx->dev,
+					 "idx %d exceeds mode size %d\n", idx, mode_count);
+				return;
+			}
+
+			data = &ctx->te2.mode_data[idx];
+			data->mode = &ctx->desc->lp_mode[i].mode;
+			data->binned_lp = binned_lp;
+			data->timing.rising_edge =
+					binned_lp->te2_timing.rising_edge;
+			data->timing.falling_edge =
+					binned_lp->te2_timing.falling_edge;
+		}
 	}
+
+	ctx->te2.option = TE2_OPT_CHANGEABLE;
 }
 
 static const struct drm_bridge_funcs exynos_panel_bridge_funcs = {
@@ -3491,6 +3729,11 @@ int exynos_panel_common_init(struct mipi_dsi_device *dsi,
 	if (ret)
 		dev_err(ctx->dev, "unable to create bl_device_groups groups\n");
 
+	if (exynos_panel_func && exynos_panel_func->set_cabc_mode) {
+		ret = sysfs_create_file(&ctx->bl->dev.kobj, &dev_attr_cabc_mode.attr);
+		if (ret)
+			dev_err(ctx->dev, "unable to create cabc_mode\n");
+	}
 	exynos_panel_handoff(ctx);
 
 	ret = mipi_dsi_attach(dsi);
@@ -3530,6 +3773,7 @@ int exynos_panel_remove(struct mipi_dsi_device *dsi)
 	drm_bridge_remove(&ctx->bridge);
 
 	sysfs_remove_groups(&ctx->bl->dev.kobj, bl_device_groups);
+	sysfs_remove_file(&ctx->bl->dev.kobj, &dev_attr_cabc_mode.attr);
 	devm_backlight_device_unregister(ctx->dev, ctx->bl);
 
 	return 0;

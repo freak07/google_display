@@ -92,6 +92,9 @@ static const struct exynos_dsi_cmd s6e3fc3_p10_init_cmds[] = {
 	EXYNOS_DSI_CMD_SEQ(0x2B, 0x00, 0x00, 0x09, 0x5F), /* PASET */
 
 	EXYNOS_DSI_CMD0(test_key_on_f0),
+	/* TE width */
+	EXYNOS_DSI_CMD_SEQ(0xB9, 0x01, 0x09, 0x5C, 0x00, 0x0B),
+
 	EXYNOS_DSI_CMD_SEQ(0xB0, 0x27, 0xF2), /* Global Para */
 	EXYNOS_DSI_CMD_SEQ(0xF2, 0x00), /* FQ CON */
 	EXYNOS_DSI_CMD_SEQ(0xB0, 0x0E, 0xF2), /* Global Para */
@@ -165,6 +168,7 @@ static DEFINE_EXYNOS_CMD_SET(s6e3fc3_p10_lhbm_location);
 
 static const struct exynos_dsi_cmd s6e3fc3_p10_mode_ns_60_cmds[] = {
 	EXYNOS_DSI_CMD0(test_key_on_f0),
+	EXYNOS_DSI_CMD_SEQ(0xB9, 0x00), /* TE width (default) */
 	EXYNOS_DSI_CMD_SEQ(0xB0, 0x27, 0xF2), /* Global Para */
 	EXYNOS_DSI_CMD_SEQ(0xF2, 0x80), /* FQ CON */
 	EXYNOS_DSI_CMD_SEQ(0x60, 0x00), /* 60 hz NS */
@@ -198,6 +202,9 @@ static DEFINE_EXYNOS_CMD_SET(s6e3fc3_p10_mode_ns_60);
 
 static const struct exynos_dsi_cmd s6e3fc3_p10_mode_hs_60_cmds[] = {
 	EXYNOS_DSI_CMD0(test_key_on_f0),
+	/* TE width */
+	EXYNOS_DSI_CMD_SEQ(0xB9, 0x01, 0x09, 0x5C, 0x00, 0x0B),
+
 	EXYNOS_DSI_CMD_SEQ(0xB0, 0x27, 0xF2), /* Global Para */
 	EXYNOS_DSI_CMD_SEQ(0xF2, 0x00), /* FQ CON */
 	EXYNOS_DSI_CMD_SEQ(0x60, 0x00), /* 60 hz HS */
@@ -224,6 +231,9 @@ static DEFINE_EXYNOS_CMD_SET(s6e3fc3_p10_mode_hs_60);
 
 static const struct exynos_dsi_cmd s6e3fc3_p10_mode_hs_90_cmds[] = {
 	EXYNOS_DSI_CMD0(test_key_on_f0),
+	/* TE width */
+	EXYNOS_DSI_CMD_SEQ(0xB9, 0x01, 0x09, 0x5C, 0x00, 0x0B),
+
 	EXYNOS_DSI_CMD_SEQ(0xB0, 0x27, 0xF2), /* Global Para */
 	EXYNOS_DSI_CMD_SEQ(0xF2, 0x00), /* FQ CON */
 	EXYNOS_DSI_CMD_SEQ(0x60, 0x08), /* 90 hz HS */
@@ -516,6 +526,7 @@ static void s6e3fc3_p10_set_nolp_mode(struct exynos_panel *ctx,
 		EXYNOS_DCS_WRITE_TABLE(ctx, test_key_on_f0);
 		EXYNOS_DCS_WRITE_TABLE(ctx, new_gamma_ip_enable);
 	}
+	/* backlight control and dimming */
 	s6e3fc3_p10_update_wrctrld(ctx);
 	if (ctx->panel_rev >= PANEL_REV_EVT1)
 		EXYNOS_DCS_WRITE_TABLE(ctx, test_key_off_f0);
@@ -596,16 +607,39 @@ static void s6e3fc3_p10_set_hbm_mode(struct exynos_panel *exynos_panel,
 static void s6e3fc3_p10_set_dimming_on(struct exynos_panel *exynos_panel,
 				 bool dimming_on)
 {
-	exynos_panel->dimming_on = dimming_on;
+	const struct exynos_panel_mode *pmode = exynos_panel->current_mode;
 
+	exynos_panel->dimming_on = dimming_on;
+	if (pmode->exynos_mode.is_lp_mode) {
+		dev_info(exynos_panel->dev,"in lp mode, skip to update");
+		return;
+	}
 	s6e3fc3_p10_update_wrctrld(exynos_panel);
 }
 
 static void s6e3fc3_p10_set_local_hbm_mode(struct exynos_panel *exynos_panel,
 				 bool local_hbm_en)
 {
+	const struct exynos_panel_mode *pmode;
+
 	if (exynos_panel->hbm.local_hbm.enabled == local_hbm_en)
 		return;
+
+	pmode = exynos_panel->current_mode;
+	if (unlikely(pmode == NULL)) {
+		dev_err(exynos_panel->dev, "%s: unknown current mode\n", __func__);
+		return;
+	}
+
+	if (local_hbm_en) {
+		const int vrefresh = drm_mode_vrefresh(&pmode->mode);
+		/* Add check to turn on LHBM @ 90hz only to comply with HW requirement */
+		if (vrefresh != 90) {
+			dev_err(exynos_panel->dev, "unexpected mode `%s` while enabling LHBM, give up\n",
+				pmode->mode.name);
+			return;
+		}
+	}
 
 	exynos_panel->hbm.local_hbm.enabled = local_hbm_en;
 	s6e3fc3_p10_update_wrctrld(exynos_panel);
@@ -635,6 +669,13 @@ static void s6e3fc3_p10_panel_init(struct exynos_panel *ctx)
 					   &s6e3fc3_p10_init_cmd_set, "init");
 	s6e3fc3_p10_lhbm_gamma_read(ctx);
 	s6e3fc3_p10_lhbm_gamma_write(ctx);
+}
+
+static int s6e3fc3_p10_read_id(struct exynos_panel *ctx)
+{
+	if (ctx->panel_rev < PANEL_REV_DVT1)
+		return exynos_panel_read_id(ctx);
+	return exynos_panel_read_ddic_id(ctx);
 }
 
 static void s6e3fc3_p10_get_panel_rev(struct exynos_panel *ctx, u32 id)
@@ -688,6 +729,7 @@ static const struct exynos_panel_mode s6e3fc3_p10_modes[] = {
 		.exynos_mode = {
 			.mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS,
 			.vblank_usec = 120,
+			.te_usec = 5760,
 			.bpc = 8,
 			.dsc = {
 				.enabled = true,
@@ -721,6 +763,7 @@ static const struct exynos_panel_mode s6e3fc3_p10_modes[] = {
 		.exynos_mode = {
 			.mode_flags = MIPI_DSI_CLOCK_NON_CONTINUOUS,
 			.vblank_usec = 120,
+			.te_usec = 215,
 			.bpc = 8,
 			.dsc = {
 				.enabled = true,
@@ -794,6 +837,7 @@ static const struct exynos_panel_funcs s6e3fc3_p10_exynos_funcs = {
 	.configure_te2_edges = exynos_panel_configure_te2_edges,
 	.update_te2 = s6e3fc3_p10_update_te2,
 	.set_op_hz = s6e3fc3_p10_set_op_hz,
+	.read_id = s6e3fc3_p10_read_id,
 };
 
 const struct brightness_capability s6e3fc3_p10_brightness_capability = {

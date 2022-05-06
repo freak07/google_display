@@ -46,6 +46,8 @@
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
 
+#define EXYNOS_DRM_WAIT_FENCE_TIMEOUT_MS 250
+
 EXPORT_TRACEPOINT_SYMBOL(tracing_mark_write);
 
 static struct exynos_drm_priv_state *exynos_drm_get_priv_state(struct drm_atomic_state *state)
@@ -109,7 +111,9 @@ static int exynos_atomic_check_windows(struct drm_device *dev, struct drm_atomic
 		to_exynos_crtc_state(old_crtc_state);
 		new_exynos_crtc_state = to_exynos_crtc_state(new_crtc_state);
 
-		if (!new_crtc_state->active_changed && !new_crtc_state->zpos_changed)
+		if (!new_crtc_state->active_changed && !new_crtc_state->zpos_changed &&
+		    !new_crtc_state->connectors_changed &&
+		    (old_crtc_state->plane_mask == new_crtc_state->plane_mask))
 			continue;
 
 		old_win_cnt = exynos_drm_crtc_get_win_cnt(old_crtc_state);
@@ -381,6 +385,68 @@ static const struct drm_private_state_funcs exynos_priv_state_funcs = {
 	.atomic_destroy_state = exynos_atomic_destroy_priv_state,
 };
 
+static void print_drm_plane_state_info(struct drm_printer *p,
+	struct drm_plane_state *state)
+{
+	drm_printf(p, "plane: rotation=%x zpos=%x alpha=%x blend_mode=%x\n",
+		state->rotation, state->normalized_zpos, state->alpha,
+		state->pixel_blend_mode);
+	drm_printf(p, "plane: crtc-pos=" DRM_RECT_FMT "\n", DRM_RECT_ARG(&state->dst));
+	drm_printf(p, "plane: src-pos=" DRM_RECT_FP_FMT "\n", DRM_RECT_FP_ARG(&state->src));
+	drm_printf(p, "plane: fb allocated by = %s\n", state->fb->comm);
+}
+
+static int exynos_atomic_helper_wait_for_fences(struct drm_device *dev,
+				      struct drm_atomic_state *state,
+				      bool pre_swap)
+{
+	struct drm_plane *plane;
+	struct drm_plane_state *new_plane_state;
+	int i, ret, err = 0;
+	struct drm_printer p = drm_info_printer(dev->dev);
+
+	for_each_new_plane_in_state(state, plane, new_plane_state, i) {
+		struct dma_fence *fence = new_plane_state->fence;
+
+		if (!fence)
+			continue;
+
+		WARN_ON(!new_plane_state->fb);
+		ret = dma_fence_wait_timeout(fence, pre_swap,
+			msecs_to_jiffies(EXYNOS_DRM_WAIT_FENCE_TIMEOUT_MS));
+		if (ret == 0) {
+			pr_err("%s: timeout of waiting for fence, name:%s idx:%d\n",
+				__func__, plane->name ? : "NA", plane->index);
+			print_drm_plane_state_info(&p, new_plane_state);
+
+			spin_lock_irq(fence->lock);
+			drm_printf(&p, "fence: %s-%s %llu-%llu status:%s\n",
+				fence->ops ? fence->ops->get_driver_name(fence) : "none",
+				fence->ops ? fence->ops->get_timeline_name(fence) : "none",
+				fence->context, fence->seqno,
+				dma_fence_get_status_locked(fence) < 0 ? "error" : "active");
+			if (test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &fence->flags)) {
+				struct timespec64 ts64 = ktime_to_timespec64(fence->timestamp);
+				drm_printf(&p, "fence: timestamp:%lld.%09ld\n",
+					(s64)ts64.tv_sec, ts64.tv_nsec);
+			}
+			if (fence->error)
+				drm_printf(&p, "fence: err=%d\n", fence->error);
+			spin_unlock_irq(fence->lock);
+
+			err = -ETIMEDOUT;
+		} else if (ret < 0) {
+			pr_warn("%s: error of waiting for dma fence, ret=%d\n", __func__, ret);
+			print_drm_plane_state_info(&p, new_plane_state);
+			return ret;
+		}
+		dma_fence_put(fence);
+		new_plane_state->fence = NULL;
+	}
+
+	return err;
+}
+
 static void commit_tail(struct drm_atomic_state *old_state)
 {
 	struct drm_device *dev = old_state->dev;
@@ -389,7 +455,7 @@ static void commit_tail(struct drm_atomic_state *old_state)
 	funcs = dev->mode_config.helper_private;
 
 	DPU_ATRACE_BEGIN("wait_for_fences");
-	drm_atomic_helper_wait_for_fences(dev, old_state, false);
+	exynos_atomic_helper_wait_for_fences(dev, old_state, false);
 	DPU_ATRACE_END("wait_for_fences");
 
 	drm_atomic_helper_wait_for_dependencies(old_state);

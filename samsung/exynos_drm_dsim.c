@@ -24,6 +24,7 @@
 #include <drm/drm_vblank.h>
 
 #include <linux/clk.h>
+#include <linux/console.h>
 #include <linux/gpio/consumer.h>
 #include <linux/irq.h>
 #include <linux/of_address.h>
@@ -148,8 +149,11 @@ static struct drm_crtc *drm_encoder_get_old_crtc(struct drm_encoder *encoder,
 static void dsim_dump(struct dsim_device *dsim)
 {
 	struct dsim_regs regs;
+	struct drm_printer p = console_set_on_cmdline ?
+		drm_debug_printer("[drm]") : drm_info_printer(dsim->dev);
 
-	dsim_info(dsim, "=== DSIM SFR DUMP ===\n");
+	drm_printf(&p, "%s[%d]: === DSIM SFR DUMP ===\n",
+		dsim->dev->driver->name, dsim->id);
 
 	if (dsim->state != DSIM_STATE_HSCLKEN)
 		return;
@@ -158,7 +162,7 @@ static void dsim_dump(struct dsim_device *dsim)
 	regs.ss_regs = dsim->res.ss_reg_base;
 	regs.phy_regs = dsim->res.phy_regs;
 	regs.phy_regs_ex = dsim->res.phy_regs_ex;
-	__dsim_dump(dsim->id, &regs);
+	__dsim_dump(&p, dsim->id, &regs);
 }
 
 static int dsim_phy_power_on(struct dsim_device *dsim)
@@ -414,6 +418,9 @@ static void _dsim_disable(struct dsim_device *dsim)
 	mutex_unlock(&dsim->state_lock);
 
 	dsim_phy_power_off(dsim);
+	dsim->total_pend_ph = 0;
+	dsim->total_pend_pl = 0;
+	dsim->force_batching = false;
 
 #if defined(CONFIG_CPU_IDLE)
 	exynos_update_ip_idle_status(dsim->idle_ip_index, 1);
@@ -1753,6 +1760,7 @@ static int dsim_wait_for_cmd_fifo_empty(struct dsim_device *dsim, bool is_long)
 {
 	int ret = 0;
 
+	DPU_ATRACE_BEGIN(__func__);
 	if (is_long)
 		ret = __dsim_wait_for_pl_fifo_empty(dsim);
 
@@ -1761,6 +1769,7 @@ static int dsim_wait_for_cmd_fifo_empty(struct dsim_device *dsim, bool is_long)
 	if (ret)
 		dsim_dump(dsim);
 
+	DPU_ATRACE_END(__func__);
 	return ret;
 }
 
@@ -1875,8 +1884,11 @@ static void need_wait_vblank(struct dsim_device *dsim)
 	dsim_debug(dsim, "last(%lld) cur(%lld) diff(%lld) ready allow period(%d)\n",
 			last_vblanktime, cur_time, diff, ready_allow_period);
 
-	if (diff > ready_allow_period)
+	if (diff > ready_allow_period) {
+		DPU_ATRACE_BEGIN("dsim_pktgo_wait_vblank");
 		drm_crtc_wait_one_vblank(crtc);
+		DPU_ATRACE_END("dsim_pktgo_wait_vblank");
+	}
 	drm_crtc_vblank_put(crtc);
 }
 
@@ -1887,8 +1899,18 @@ dsim_write_data(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 {
 	int ret = 0;
 	u16 flags = msg->flags;
-	bool is_long = mipi_dsi_packet_format_is_long(msg->type);
+	bool is_long;
+	bool is_empty_msg;
+	bool is_last;
 
+	if (flags & EXYNOS_DSI_MSG_FORCE_BATCH) {
+		WARN_ON(dsim->force_batching);
+		dsim->force_batching = true;
+		return 0;
+	}
+
+	DPU_ATRACE_BEGIN(__func__);
+	is_long = mipi_dsi_packet_format_is_long(msg->type);
 	if (dsim->config.mode == DSIM_VIDEO_MODE) {
 		ret = dsim_write_single_cmd_locked(dsim, msg, is_long);
 		goto err;
@@ -1904,22 +1926,30 @@ dsim_write_data(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 		goto err;
 	}
 
-	if (!IS_LAST(msg->flags) &&
+	is_last = (IS_LAST(flags) && !dsim->force_batching) || (flags & EXYNOS_DSI_MSG_FORCE_FLUSH);
+	is_empty_msg = msg->tx_len == 0;
+	if (flags & EXYNOS_DSI_MSG_FORCE_FLUSH) {
+		dsim->force_batching = false;
+		WARN_ON(!is_empty_msg);
+	}
+
+	if (!is_last && !is_empty_msg &&
 		(((dsim->total_pend_ph + 1) == MAX_PH_FIFO) ||
 		((dsim->total_pend_pl + msg->tx_len) > PL_FIFO_THRESHOLD))) {
 		dsim_warn(dsim, "warning. changed last command. pend pl/pl(%u,%u)\n",
 				dsim->total_pend_ph, dsim->total_pend_pl);
-		flags |= MIPI_DSI_MSG_LASTCOMMAND;
+		is_last = true;
 	}
 
-	dsim_debug(dsim, "%s last command\n", IS_LAST(flags) ? "" : "Not");
+	dsim_debug(dsim, "%s last command\n", is_last ? "" : "Not");
 
-	if (IS_LAST(flags)) {
+	if (is_last) {
 		if (dsim->total_pend_ph) {
 			reinit_completion(is_long ?
 					&dsim->pl_wr_comp : &dsim->ph_wr_comp);
 
-			__dsim_write_data(dsim, msg, is_long);
+			if (!is_empty_msg)
+				__dsim_write_data(dsim, msg, is_long);
 
 			if (!(flags & EXYNOS_DSI_MSG_IGNORE_VBLANK))
 				need_wait_vblank(dsim);
@@ -1935,10 +1965,10 @@ dsim_write_data(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 			}
 
 			pm_runtime_put_sync(dsim->dev);
-		} else {
+		} else if (!is_empty_msg) {
 			ret = dsim_write_single_cmd_locked(dsim, msg, is_long);
 		}
-	} else {
+	} else if (!is_empty_msg) {
 		if (!dsim->total_pend_ph) {
 			pm_runtime_get_sync(dsim->dev);
 			dsim_reg_enable_packetgo(dsim->id, true);
@@ -1951,6 +1981,7 @@ dsim_write_data(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 	}
 
 err:
+	DPU_ATRACE_END(__func__);
 	return ret;
 }
 

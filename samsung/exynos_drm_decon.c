@@ -21,6 +21,7 @@
 #include <linux/atomic.h>
 #include <linux/clk.h>
 #include <linux/component.h>
+#include <linux/console.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/of.h>
@@ -96,8 +97,9 @@ static inline unsigned long fps_timeout(int fps)
 void decon_dump(const struct decon_device *decon)
 {
 	int i;
-	int acquired = console_trylock();
 	struct decon_device *d;
+	struct drm_printer p = console_set_on_cmdline ?
+		drm_debug_printer("[drm]") : drm_info_printer(decon->dev);
 
 	for (i = 0; i < REGS_DECON_ID_MAX; ++i) {
 		d = get_decon_drvdata(i);
@@ -105,24 +107,22 @@ void decon_dump(const struct decon_device *decon)
 			continue;
 
 		if (d->state != DECON_STATE_ON) {
-			decon_info(decon, "DECON disabled(%d)\n", decon->state);
+			drm_printf(&p, "%s[%u]: DECON disabled(%d)\n",
+				decon->dev->driver->name, decon->id, decon->state);
 			continue;
 		}
 
-		__decon_dump(d->id, &d->regs, d->config.dsc.enabled, d->dqe != NULL);
+		__decon_dump(&p, d->id, &d->regs, d->config.dsc.enabled, d->dqe != NULL);
 	}
 
 	for (i = 0; i < decon->dpp_cnt; ++i)
-		dpp_dump(decon->dpp[i]);
+		dpp_dump(&p, decon->dpp[i]);
 
 	if (decon->rcd)
-		rcd_dump(decon->rcd);
+		rcd_dump(&p, decon->rcd);
 
 	if (decon->cgc_dma)
-		cgc_dump(decon->cgc_dma);
-
-	if (acquired)
-		console_unlock();
+		cgc_dump(&p, decon->cgc_dma);
 }
 
 static inline u32 win_start_pos(int x, int y)
@@ -529,6 +529,8 @@ static void _dpp_disable(struct dpp_device *dpp)
 	if (dpp->is_win_connected) {
 		dpp->disable(dpp);
 		dpp->is_win_connected = false;
+	} else if (test_bit(DPP_ATTR_RCD, &dpp->attr)) {
+		dpp->disable(dpp);
 	}
 }
 
@@ -556,6 +558,7 @@ static void decon_update_plane(struct exynos_drm_crtc *exynos_crtc,
 	if (test_bit(DPP_ATTR_RCD, &dpp->attr)) {
 		decon_debug(decon, "%s -\n", __func__);
 		dpp->update(dpp, exynos_plane_state);
+		dpp->win_id = MAX_WIN_PER_DECON;
 		return;
 	}
 
@@ -631,10 +634,8 @@ static void decon_disable_plane(struct exynos_drm_crtc *exynos_crtc,
 
 	decon_debug(decon, "%s +\n", __func__);
 
-	if (!test_bit(DPP_ATTR_RCD, &dpp->attr)) {
-		decon_disable_win(decon, dpp->win_id);
-		_dpp_disable(dpp);
-	}
+	decon_disable_win(decon, dpp->win_id);
+	_dpp_disable(dpp);
 
 	DPU_EVENT_LOG(DPU_EVT_PLANE_DISABLE, decon->id, dpp);
 	decon_debug(decon, "%s -\n", __func__);
@@ -756,8 +757,8 @@ static void decon_atomic_flush(struct exynos_drm_crtc *exynos_crtc,
 	else if (old_exynos_crtc_state->wb_type == EXYNOS_WB_CWB)
 		decon_reg_set_cwb_enable(decon->id, false);
 
-	/* if there are no planes attached, enable colormap as fallback */
-	if (new_crtc_state->plane_mask == 0) {
+	/* if there are no dpp planes attached, enable colormap as fallback */
+	if ((new_crtc_state->plane_mask & ~exynos_crtc->rcd_plane_mask) == 0) {
 		const int win_id = decon_get_win_id(new_crtc_state, 0);
 
 		if (win_id < 0) {
@@ -1013,6 +1014,9 @@ static void _decon_stop(struct decon_device *decon, bool reset, u32 vrefresh)
 		decon_reg_set_win_enable(decon->id, i, 0);
 	}
 
+	decon->bts.rcd_win_config.win.state = DPU_WIN_STATE_DISABLED;
+	decon->bts.rcd_win_config.dma_addr = 0;
+
 	for (i = 0; i < decon->dpp_cnt; ++i) {
 		struct dpp_device *dpp = decon->dpp[i];
 
@@ -1029,6 +1033,9 @@ static void _decon_stop(struct decon_device *decon, bool reset, u32 vrefresh)
 			dpp->dbg_dma_addr = 0;
 		}
 	}
+
+	if (decon->rcd)
+		_dpp_disable(decon->rcd);
 
 	decon_reg_stop(decon->id, &decon->config, reset, fps);
 
@@ -1253,7 +1260,7 @@ static void decon_wait_for_flip_done(struct exynos_drm_crtc *crtc,
 
 			atomic_set(&decon->frames_pending, 0);
 			if (!recovering)
-				decon_dump_all(decon, DPU_EVT_CONDITION_ALL, false);
+				decon_dump_all(decon, DPU_EVT_CONDITION_DEFAULT, false);
 
 			decon_force_vblank_event(decon);
 
@@ -1294,8 +1301,14 @@ static int dpu_sysmmu_fault_handler(struct iommu_fault *fault, void *data)
 
 	decon_warn(decon, "%s +\n", __func__);
 
-	decon_dump_all(decon, DPU_EVT_CONDITION_ALL, false);
+	decon_dump_all(decon, DPU_EVT_CONDITION_DEFAULT, false);
 
+	return 0;
+}
+
+static ssize_t early_wakeup_show(struct device *dev,
+			struct device_attribute *attr, char *buf)
+{
 	return 0;
 }
 
@@ -1321,7 +1334,7 @@ static ssize_t early_wakeup_store(struct device *dev,
 
 	return len;
 }
-static DEVICE_ATTR_WO(early_wakeup);
+static DEVICE_ATTR_RW(early_wakeup);
 
 static int decon_bind(struct device *dev, struct device *master, void *data)
 {
@@ -2002,6 +2015,7 @@ static int decon_runtime_suspend(struct device *dev)
 		decon_warn(decon, "decon state = %u at suspending\n",
 			decon->state);
 		WARN_ON(1);
+		decon_dump_all(decon, DPU_EVT_CONDITION_DEFAULT, false);
 		return -EINVAL;
 	}
 
@@ -2029,6 +2043,7 @@ static int decon_runtime_resume(struct device *dev)
 		decon_warn(decon, "decon state = %u at resuming\n",
 			decon->state);
 		WARN_ON(1);
+		decon_dump_all(decon, DPU_EVT_CONDITION_DEFAULT, false);
 		return -EINVAL;
 	}
 
