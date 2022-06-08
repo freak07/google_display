@@ -941,6 +941,9 @@ static ssize_t serial_number_show(struct device *dev,
 	if (!ctx->initialized)
 		return -EPERM;
 
+	if (!strcmp(ctx->panel_id, ""))
+		return -EINVAL;
+
 	return snprintf(buf, PAGE_SIZE, "%s\n", ctx->panel_id);
 }
 
@@ -1387,9 +1390,6 @@ static ssize_t osc2_clk_khz_store(struct device *dev, struct device_attribute *a
 	unsigned int osc2_clk_khz;
 	int ret;
 
-	if (!is_panel_active(ctx))
-		return -EPERM;
-
 	if (!funcs || !funcs->set_osc2_clk_khz)
 		return -EOPNOTSUPP;
 
@@ -1411,9 +1411,6 @@ static ssize_t osc2_clk_khz_show(struct device *dev, struct device_attribute *at
 {
 	const struct mipi_dsi_device *dsi = to_mipi_dsi_device(dev);
 	struct exynos_panel *ctx = mipi_dsi_get_drvdata(dsi);
-
-	if (!is_panel_active(ctx))
-		return -EPERM;
 
 	return scnprintf(buf, PAGE_SIZE, "%u\n", ctx->osc2_clk_khz);
 }
@@ -1689,7 +1686,7 @@ static void exynos_panel_set_cabc(struct exynos_panel *ctx, enum exynos_cabc_mod
 
 static void exynos_panel_pre_commit_properties(
 				struct exynos_panel *ctx,
-				const struct exynos_drm_connector_state *conn_state)
+				struct exynos_drm_connector_state *conn_state)
 {
 	const struct exynos_panel_funcs *exynos_panel_func = ctx->desc->exynos_panel_func;
 	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
@@ -1699,9 +1696,19 @@ static void exynos_panel_pre_commit_properties(
 	if (!conn_state->pending_update_flags)
 		return;
 
+	dev_info(ctx->dev, "%s: mipi_sync(0x%lx) pending_update_flags(0x%x)\n", __func__,
+		conn_state->mipi_sync, conn_state->pending_update_flags);
 	DPU_ATRACE_BEGIN(__func__);
 	mipi_sync = conn_state->mipi_sync &
 		(MIPI_CMD_SYNC_LHBM | MIPI_CMD_SYNC_GHBM | MIPI_CMD_SYNC_BL);
+
+	if ((conn_state->mipi_sync & (MIPI_CMD_SYNC_LHBM | MIPI_CMD_SYNC_GHBM)) &&
+		ctx->current_mode->exynos_mode.is_lp_mode) {
+		conn_state->pending_update_flags &=
+			~(HBM_FLAG_LHBM_UPDATE | HBM_FLAG_GHBM_UPDATE | HBM_FLAG_BL_UPDATE);
+		dev_warn(ctx->dev, "%s: avoid LHBM/GHBM/BL updates during lp mode\n",
+			__func__);
+	}
 
 	if (mipi_sync) {
 		exynos_panel_check_mipi_sync_timing(conn_state->base.crtc,
@@ -1752,19 +1759,21 @@ static void exynos_panel_pre_commit_properties(
 	if (mipi_sync)
 		exynos_dsi_dcs_write_buffer_force_batch_end(dsi);
 
-	if ((MIPI_CMD_SYNC_GHBM & conn_state->mipi_sync)) {
+	if (((MIPI_CMD_SYNC_GHBM | MIPI_CMD_SYNC_BL) & conn_state->mipi_sync)
+	    && !(MIPI_CMD_SYNC_LHBM & conn_state->mipi_sync)
+	    && ctx->desc->dbv_extra_frame) {
 		/**
-		 * panel needs one extra VSYNC period to apply GHBM. The frame
+		 * panel needs one extra VSYNC period to apply GHBM/dbv. The frame
 		 * update should be delayed.
 		 */
-		DPU_ATRACE_BEGIN("ghbm_wait");
+		DPU_ATRACE_BEGIN("dbv_wait");
 		if (!drm_crtc_vblank_get(conn_state->base.crtc)) {
 			drm_crtc_wait_one_vblank(conn_state->base.crtc);
 			drm_crtc_vblank_put(conn_state->base.crtc);
 		} else {
-			pr_warn("%s failed to get vblank for ghbm wait\n", __func__);
+			pr_warn("%s failed to get vblank for dbv wait\n", __func__);
 		}
-		DPU_ATRACE_END("ghbm_wait");
+		DPU_ATRACE_END("dbv_wait");
 	}
 
 	if (ghbm_updated)
@@ -3245,12 +3254,23 @@ static void exynos_panel_bridge_disable(struct drm_bridge *bridge,
 		mutex_unlock(&ctx->mode_lock);
 	} else {
 		if (crtc_state && crtc_state->mode_changed &&
-		    drm_atomic_crtc_effectively_active(crtc_state))
+		    drm_atomic_crtc_effectively_active(crtc_state)) {
+			if (ctx->desc->delay_dsc_reg_init_us) {
+				struct exynos_drm_connector_state *exynos_conn_state =
+							to_exynos_connector_state(conn_state);
+				struct exynos_display_mode *exynos_mode =
+							&exynos_conn_state->exynos_mode;
+
+				exynos_mode->dsc.delay_reg_init_us =
+							ctx->desc->delay_dsc_reg_init_us;
+			}
+
 			ctx->panel_state = PANEL_STATE_MODESET;
-		else if (ctx->force_power_on)
+		} else if (ctx->force_power_on) {
 			ctx->panel_state = PANEL_STATE_BLANK;
-		else
+		} else {
 			ctx->panel_state = PANEL_STATE_OFF;
+		}
 
 		drm_panel_disable(&ctx->panel);
 	}
