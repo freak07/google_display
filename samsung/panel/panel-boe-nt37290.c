@@ -9,6 +9,7 @@
  * published by the Free Software Foundation.
  */
 
+#include <drm/drm_file.h>
 #include <linux/debugfs.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
@@ -142,7 +143,7 @@ static const struct exynos_dsi_cmd nt37290_lp_high_cmds[] = {
 static const struct exynos_binned_lp nt37290_binned_lp[] = {
 	BINNED_LP_MODE("off", 0, nt37290_lp_off_cmds),
 	/* rising = 0, falling = 48 */
-	BINNED_LP_MODE_TIMING("low", 80, nt37290_lp_low_cmds, 0, 48),
+	BINNED_LP_MODE_TIMING("low", 360, nt37290_lp_low_cmds, 0, 48),
 	BINNED_LP_MODE_TIMING("high", 3584, nt37290_lp_high_cmds, 0, 48),
 };
 
@@ -718,6 +719,26 @@ static bool nt37290_change_frequency(struct exynos_panel *ctx,
 	return updated;
 }
 
+
+static void nt37290_panel_idle_notification(struct exynos_panel *ctx,
+				u32 display_id, u32 vrefresh, u32 idle_te_vrefresh)
+{
+	char event_string[64];
+	char *envp[] = { event_string, NULL };
+	struct drm_device *dev = ctx->bridge.dev;
+
+	if (vrefresh == idle_te_vrefresh)
+		return;
+
+	if (!dev) {
+		dev_warn(ctx->dev, "%s: drm_device is null\n", __func__);
+	} else {
+		snprintf(event_string, sizeof(event_string),
+			"PANEL_IDLE_ENTER=%u,%u,%u", display_id, vrefresh, idle_te_vrefresh);
+		kobject_uevent_env(&dev->primary->kdev->kobj, KOBJ_CHANGE, envp);
+	}
+}
+
 static bool nt37290_set_self_refresh(struct exynos_panel *ctx, bool enable)
 {
 	const struct exynos_panel_mode *pmode = ctx->current_mode;
@@ -742,9 +763,14 @@ static bool nt37290_set_self_refresh(struct exynos_panel *ctx, bool enable)
 	updated = nt37290_change_frequency(ctx, pmode);
 
 	if (pmode->idle_mode == IDLE_MODE_ON_SELF_REFRESH) {
+		const int vrefresh = drm_mode_vrefresh(&pmode->mode);
+
+		if (enable && ctx->panel_idle_vrefresh)
+			nt37290_panel_idle_notification(ctx, 0, vrefresh, 120);
+
 		dev_dbg(ctx->dev, "%s: %s idle (%dHz) for mode %s\n",
 			__func__, enable ? "enter" : "exit",
-			ctx->panel_idle_vrefresh ? : drm_mode_vrefresh(&pmode->mode),
+			ctx->panel_idle_vrefresh ? : vrefresh,
 			pmode->mode.name);
 	}
 
@@ -1138,17 +1164,15 @@ static u16 nt37290_convert_to_dvt1_nonlinear_br(struct exynos_panel *ctx, u16 br
 {
 	u16 i, range = 0;
 	u16 num_range = dvt1_br_settings.num_of_nonlinear_ranges;
-	u16 min_br = dvt1_br_settings.nonlinear_range_data[num_range - 1].level;
-	u16 max_br = dvt1_br_settings.nonlinear_range_data[0].level;
-	const u64 x1 = min_br * 100000;
-	const u64 x2 = max_br * 100000;
-	const u64 y1 = (dvt1_br_settings.nonlinear_range_data[num_range - 1].nits) * 100000;
-	const u64 y2 = (dvt1_br_settings.nonlinear_range_data[0].nits) * 100000;
-	u64 x;
+	u16 min_br_nbm = dvt1_br_settings.nonlinear_range_data[num_range - 1].level;
+	u16 max_br_nbm = dvt1_br_settings.nonlinear_range_data[1].level;
+	u16 min_br_hbm = max_br_nbm + 1;
+	u16 max_br_hbm = dvt1_br_settings.nonlinear_range_data[0].level;
+	u64 x1, x2, y1, y2, x;
 	s64 y, a, b, c, level = br;
 	int ret;
 
-	if (br <= min_br || br >= max_br) {
+	if (br <= min_br_nbm || br == max_br_nbm || br >= max_br_hbm) {
 		dev_dbg(ctx->dev, "%s: level %u\n", __func__, br);
 		return br;
 	}
@@ -1157,6 +1181,17 @@ static u16 nt37290_convert_to_dvt1_nonlinear_br(struct exynos_panel *ctx, u16 br
 	 * x is level (DBV), y is brightness (nits). Multiplied by 10^5 to
 	 * have sufficient accuracy without overflow.
 	 */
+	if (br <= max_br_nbm ) {
+		x1 = min_br_nbm * 100000;
+		x2 = max_br_nbm * 100000;
+		y1 = (dvt1_br_settings.nonlinear_range_data[num_range - 1].nits) * 100000;
+		y2 = (dvt1_br_settings.nonlinear_range_data[1].nits) * 100000;
+	} else {
+		x1 = min_br_hbm * 100000;
+		x2 = max_br_hbm * 100000;
+		y1 = (dvt1_br_settings.nonlinear_range_data[1].nits) * 100000;
+		y2 = (dvt1_br_settings.nonlinear_range_data[0].nits) * 100000;
+	}
 	x = br * 100000;
 	y = linear_interpolation(x1, x2, y1, y2, x);
 	/**
@@ -1182,11 +1217,11 @@ static u16 nt37290_convert_to_dvt1_nonlinear_br(struct exynos_panel *ctx, u16 br
 	b = dvt1_br_settings.nonlinear_range_data[range].coef_b;
 	c = dvt1_br_settings.nonlinear_range_data[range].coef_c;
 	ret = nonlinear_calculation(a, b, c, y, &level);
-	if (ret || level < min_br || level > max_br) {
+	if (ret || level < min_br_nbm || level > max_br_hbm) {
 		dev_warn(ctx->dev, "%s: failed to convert for brightness %u, ret %d\n",
 			 __func__, br, ret);
 		if (!ret)
-			br = (level < min_br) ? min_br : max_br;
+			br = (level < min_br_nbm) ? min_br_nbm : max_br_hbm;
 		return br;
 	}
 
@@ -1200,29 +1235,34 @@ static int nt37290_set_brightness(struct exynos_panel *ctx, u16 br)
 {
 	u16 brightness;
 	struct nt37290_panel *spanel = to_spanel(ctx);
-
-	if (ctx->current_mode->exynos_mode.is_lp_mode) {
-		const struct exynos_panel_funcs *funcs;
-
-		funcs = ctx->desc->exynos_panel_func;
-		if (funcs && funcs->set_binned_lp)
-			funcs->set_binned_lp(ctx, br);
-		return 0;
-	}
+	const bool lp_mode = ctx->current_mode->exynos_mode.is_lp_mode;
 
 	spanel->hw_dbv = br;
-	if (spanel->hw_dbv == 0) {
+
+	if (!lp_mode && spanel->hw_dbv == 0) {
 		// turn off panel and set brightness directly.
 		return exynos_dcs_set_brightness(ctx, 0);
 	}
 
-	if (ctx->panel_rev >= PANEL_REV_DVT1) {
-		spanel->hw_dbv = nt37290_convert_to_dvt1_nonlinear_br(ctx, br);
-	} else if (ctx->panel_rev == PANEL_REV_EVT1_1) {
-		if (br <= evt1_1_br_settings.normal_band_data[0].level)
-			spanel->hw_dbv = nt37290_convert_to_evt1_1_nonlinear_br(ctx, br);
-	} else {
-		spanel->hw_dbv = nt37290_convert_to_evt1_br(ctx, br);
+	if (spanel->hw_dbv) {
+		if (ctx->panel_rev >= PANEL_REV_DVT1) {
+			spanel->hw_dbv = nt37290_convert_to_dvt1_nonlinear_br(ctx, br);
+		} else if (ctx->panel_rev == PANEL_REV_EVT1_1) {
+			if (br <= evt1_1_br_settings.normal_band_data[0].level)
+				spanel->hw_dbv =
+					nt37290_convert_to_evt1_1_nonlinear_br(ctx, br);
+		} else {
+			spanel->hw_dbv = nt37290_convert_to_evt1_br(ctx, br);
+		}
+	}
+
+	if (lp_mode) {
+		const struct exynos_panel_funcs *funcs;
+
+		funcs = ctx->desc->exynos_panel_func;
+		if (funcs && funcs->set_binned_lp)
+			funcs->set_binned_lp(ctx, spanel->hw_dbv);
+		return 0;
 	}
 
 	if (ctx->panel_rev >= PANEL_REV_EVT1 && ctx->hbm.local_hbm.enabled) {
