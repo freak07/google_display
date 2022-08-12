@@ -896,7 +896,7 @@ static int exynos_update_status(struct backlight_device *bl)
 	if (brightness && brightness < min_brightness)
 		brightness = min_brightness;
 
-	dev_info(ctx->dev, "req: %d, br: %d\n", bl->props.brightness,
+	dev_dbg(ctx->dev, "req: %d, br: %d\n", bl->props.brightness,
 		brightness);
 
 	mutex_lock(&ctx->mode_lock);
@@ -1700,7 +1700,7 @@ static void exynos_panel_pre_commit_properties(
 	if (!conn_state->pending_update_flags)
 		return;
 
-	dev_info(ctx->dev, "%s: mipi_sync(0x%lx) pending_update_flags(0x%x)\n", __func__,
+	dev_dbg(ctx->dev, "%s: mipi_sync(0x%lx) pending_update_flags(0x%x)\n", __func__,
 		conn_state->mipi_sync, conn_state->pending_update_flags);
 	DPU_ATRACE_BEGIN(__func__);
 	mipi_sync = conn_state->mipi_sync &
@@ -3015,7 +3015,7 @@ static void exynos_panel_set_backlight_state(struct exynos_panel *ctx,
 
 	backlight_state_changed(bl);
 
-	dev_info(ctx->dev, "%s: panel:%d, bl:0x%x\n", __func__,
+	dev_dbg(ctx->dev, "%s: panel:%d, bl:0x%x\n", __func__,
 		 panel_state, bl->props.state);
 }
 
