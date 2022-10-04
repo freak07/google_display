@@ -17,6 +17,8 @@
 
 #include "panel-samsung-drv.h"
 
+#pragma clang diagnostic ignored "-Wdeprecated-non-prototype"
+
 /* when refresh rate can go lower than this value (in auto mode), fixed TE2 should be enabled */
 #define NT37290_TE2_MIN_RATE   30
 #define NT37290_TE2_CHANGEABLE 0x02
