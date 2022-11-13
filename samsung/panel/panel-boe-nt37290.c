@@ -15,6 +15,7 @@
 #include <linux/of_platform.h>
 #include <trace/dpu_trace.h>
 #include <video/mipi_display.h>
+#include <drm/drm_vblank.h>
 
 #include "panel-samsung-drv.h"
 
@@ -403,6 +404,8 @@ static const struct exynos_dsi_cmd nt37290_init_cmds[] = {
 	EXYNOS_DSI_CMD_SEQ(0xF0, 0x55, 0xAA, 0x52, 0x08, 0x03),
 	EXYNOS_DSI_CMD_SEQ(0x6F, 0x12),
 	EXYNOS_DSI_CMD_SEQ(0xD8, 0x14),
+	EXYNOS_DSI_CMD_SEQ(0x6F, 0x34),
+	EXYNOS_DSI_CMD_SEQ(0xB6, 0x0F, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C),
 	/* CMD2 Page 8: IRC IP settings */
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0xF0, 0x55, 0xAA, 0x52, 0x08, 0x08),
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0x6F, 0x10),
@@ -411,6 +414,9 @@ static const struct exynos_dsi_cmd nt37290_init_cmds[] = {
 					       0x00),
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0x6F, 0x28),
 	EXYNOS_DSI_CMD_SEQ_REV(PANEL_REV_DVT1, 0xB8, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00),
+	/* CMD2 Page 5: remove long TE2 pulse */
+	EXYNOS_DSI_CMD_SEQ(0xF0, 0x55, 0xAA, 0x52, 0x08, 0x05),
+	EXYNOS_DSI_CMD_SEQ(0xB6, 0x06, 0x03),
 
 	/* CMD3 Page 0 */
 	EXYNOS_DSI_CMD_SEQ(0xFF, 0xAA, 0x55, 0xA5, 0x80),
@@ -893,21 +899,52 @@ static void nt37290_set_lp_mode(struct exynos_panel *ctx,
 	dev_dbg(ctx->dev, "%s: done\n", __func__);
 }
 
+static void nt37290_wait_one_vblank(struct exynos_panel *ctx,
+				    const struct exynos_panel_mode *pmode)
+{
+	struct drm_crtc *crtc = NULL;
+
+	if (ctx->exynos_connector.base.state)
+		crtc = ctx->exynos_connector.base.state->crtc;
+
+	DPU_ATRACE_BEGIN(__func__);
+
+	if (crtc && !drm_crtc_vblank_get(crtc)) {
+		drm_crtc_wait_one_vblank(crtc);
+		drm_crtc_vblank_put(crtc);
+	} else {
+		int vrefresh = drm_mode_vrefresh(&pmode->mode);
+		u32 delay_us = mult_frac(1000, 1020, vrefresh);
+
+		dev_warn(ctx->dev, "%s: failed to get vblank for %dhz\n", __func__, vrefresh);
+		usleep_range(delay_us, delay_us + 10);
+	}
+
+	DPU_ATRACE_END(__func__);
+}
+
 static void nt37290_set_nolp_mode(struct exynos_panel *ctx,
 				  const struct exynos_panel_mode *pmode)
 {
 	if (!is_panel_active(ctx))
 		return;
 
+	DPU_ATRACE_BEGIN(__func__);
+
 	/* exit AOD */
-	EXYNOS_DCS_WRITE_SEQ_DELAY(ctx, 34, 0x38);
+	EXYNOS_DCS_WRITE_SEQ(ctx, 0x38);
+	nt37290_wait_one_vblank(ctx, ctx->current_mode);
 
 	nt37290_change_frequency(ctx, pmode);
 
 	/* 2Ch needs to be sent twice in next 2 vsync */
-	EXYNOS_DCS_WRITE_TABLE_DELAY(ctx, 34, stream_2c);
 	EXYNOS_DCS_WRITE_TABLE(ctx, stream_2c);
+	nt37290_wait_one_vblank(ctx, pmode);
+	EXYNOS_DCS_WRITE_TABLE(ctx, stream_2c);
+
 	EXYNOS_DCS_WRITE_TABLE(ctx, display_on);
+
+	DPU_ATRACE_END(__func__);
 
 	dev_info(ctx->dev, "exit LP mode\n");
 }
@@ -1341,29 +1378,6 @@ static void nt37290_set_hbm_mode(struct exynos_panel *ctx,
 static void nt37290_set_local_hbm_mode(struct exynos_panel *ctx,
 				       bool local_hbm_en)
 {
-	const struct exynos_panel_mode *pmode;
-
-	if (ctx->hbm.local_hbm.enabled == local_hbm_en)
-		return;
-
-	pmode = ctx->current_mode;
-	if (unlikely(pmode == NULL)) {
-		dev_err(ctx->dev, "%s: unknown current mode\n", __func__);
-		return;
-	}
-
-	if (local_hbm_en) {
-		const int vrefresh = drm_mode_vrefresh(&pmode->mode);
-		/* Add check to turn on LHBM @ 120hz only to comply with HW requirement */
-		if (vrefresh != 120) {
-			dev_err(ctx->dev, "unexpected mode `%s` while enabling LHBM, give up\n",
-				pmode->mode.name);
-			return;
-		}
-	}
-
-	ctx->hbm.local_hbm.enabled = local_hbm_en;
-
 	if (local_hbm_en) {
 		if (ctx->panel_rev >= PANEL_REV_EVT1) {
 			struct nt37290_panel *spanel = to_spanel(ctx);
@@ -1401,9 +1415,6 @@ static void nt37290_set_local_hbm_mode(struct exynos_panel *ctx,
 static void nt37290_mode_set(struct exynos_panel *ctx,
 			     const struct exynos_panel_mode *pmode)
 {
-	if (!is_panel_active(ctx))
-		return;
-
 	nt37290_change_frequency(ctx, pmode);
 }
 
