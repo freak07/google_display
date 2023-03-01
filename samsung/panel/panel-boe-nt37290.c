@@ -452,6 +452,8 @@ static const struct exynos_dsi_cmd nt37290_init_cmds[] = {
 };
 static DEFINE_EXYNOS_CMD_SET(nt37290_init);
 
+static void nt37290_set_local_hbm_mode(struct exynos_panel *ctx, bool local_hbm_en);
+
 static u8 nt37290_get_te2_option(struct exynos_panel *ctx)
 {
 	struct nt37290_panel *spanel = to_spanel(ctx);
@@ -1005,6 +1007,15 @@ static int nt37290_disable(struct drm_panel *panel)
 	bitmap_clear(spanel->hw_feat, 0, G10_FEAT_MAX);
 	spanel->hw_vrefresh = 60;
 	spanel->hw_idle_vrefresh = 0;
+
+	if (ctx->hbm.local_hbm.enabled) {
+		dev_warn(ctx->dev, "%s: lhbm is still enabled while disabling panel\n",
+			 __func__);
+		mutex_lock(&ctx->mode_lock);
+		/* disable lhbm immediately */
+		nt37290_set_local_hbm_mode(ctx, false);
+		mutex_unlock(&ctx->mode_lock);
+	}
 
 	return exynos_panel_disable(panel);
 }

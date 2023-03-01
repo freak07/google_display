@@ -49,6 +49,7 @@ enum decon_state {
 	DECON_STATE_ON,
 	DECON_STATE_HIBERNATION,
 	DECON_STATE_OFF,
+	DECON_STATE_HANDOVER,
 };
 
 enum dpu_win_state {
@@ -163,8 +164,7 @@ struct dpu_bts {
 	/* includes writeback dpp */
 	struct dpu_bts_bw rt_bw[MAX_DPP_CNT];
 
-	/* each decon must know other decon's BW to get overall BW */
-	u32 ch_bw[3][MAX_DECON_CNT];
+	u32 ch_bw[MAX_AXI_PORT];
 	int bw_idx;
 	struct dpu_bts_ops *ops;
 #if IS_ENABLED(CONFIG_EXYNOS_PM_QOS) || IS_ENABLED(CONFIG_EXYNOS_PM_QOS_MODULE)
@@ -453,6 +453,7 @@ struct decon_device {
 	struct kthread_work		buf_dump_work;
 	struct exynos_recovery		recovery;
 	struct exynos_dma		*cgc_dma;
+	struct exynos_fb_handover	fb_handover;
 
 	u32				irq_fs;	/* frame start irq number*/
 	u32				irq_fd;	/* frame done irq number*/

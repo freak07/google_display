@@ -56,6 +56,8 @@
 #include <regs-dsim.h>
 
 #include <trace/dpu_trace.h>
+#define CREATE_TRACE_POINTS
+#include <trace/panel_trace.h>
 
 #include "exynos_drm_connector.h"
 #include "exynos_drm_crtc.h"
@@ -267,6 +269,7 @@ static void _dsim_enable(struct dsim_device *dsim)
 {
 	const struct decon_device *decon = dsim_get_decon(dsim);
 	struct dsim_device *sec_dsi;
+	bool skip_init = false;
 
 	pm_runtime_get_sync(dsim->dev);
 
@@ -285,8 +288,14 @@ static void _dsim_enable(struct dsim_device *dsim)
 #endif
 
 	dsim_phy_power_on(dsim);
+	if (dsim->state == DSIM_STATE_HANDOVER) {
+		skip_init = dsim_reg_is_pll_stable(dsim->id);
+		dsim_info(dsim, "dsim handover. skip_init=%d\n", skip_init);
+	}
 
-	dsim_reg_init(dsim->id, &dsim->config, &dsim->clk_param, true);
+	if (!skip_init)
+		dsim_reg_init(dsim->id, &dsim->config, &dsim->clk_param, true);
+
 	dsim_reg_start(dsim->id);
 
 	/* TODO: dsi start: enable irq, sfr configuration */
@@ -337,7 +346,7 @@ static void dsim_encoder_enable(struct drm_encoder *encoder, struct drm_atomic_s
 	}
 
 
-	if (dsim->state == DSIM_STATE_SUSPEND) {
+	if (dsim->state == DSIM_STATE_SUSPEND || dsim->state == DSIM_STATE_HANDOVER) {
 		_dsim_enable(dsim);
 		dsim_set_te_pinctrl(dsim, 1);
 	} else if (dsim->state == DSIM_STATE_BYPASS) {
@@ -1335,9 +1344,6 @@ static int dsim_bind(struct device *dev, struct device *master, void *data)
 
 	dsim_debug(dsim, "%s +\n", __func__);
 
-	/* parse the panel name to select the dsi device for the detected panel */
-	dsim_parse_panel_name(dsim);
-
 	if (dsim->dual_dsi == DSIM_DUAL_DSI_SEC)
 		return 0;
 
@@ -1414,6 +1420,10 @@ static int dsim_parse_dt(struct dsim_device *dsim)
 			dsim->te_from = MAX_DECON_TE_FROM_DDI;
 		}
 	}
+
+	dsim->err_fg_gpio = of_get_named_gpio(np, "errfg-gpio", 0);
+	if (dsim->err_fg_gpio < 0)
+		dsim_debug(dsim, "failed to get ERR_FG gpio\n");
 
 	return 0;
 }
@@ -1601,6 +1611,75 @@ static int dsim_register_irq(struct dsim_device *dsim)
 	return 0;
 }
 
+static irqreturn_t dsim_err_fg_irq_handler(int irq, void *dev_id)
+{
+	struct dsim_device *dsim = dev_id;
+	struct decon_device *decon;
+	int recovering;
+
+	dsim_debug(dsim, "%s +\n", __func__);
+
+	decon = (struct decon_device *)dsim_get_decon(dsim);
+	if (!decon) {
+		dsim_warn(dsim, "%s: decon is NULL\n", __func__);
+		goto end_err_fg_handler;
+	}
+
+	if (decon->state != DECON_STATE_ON && decon->state != DECON_STATE_HIBERNATION) {
+		dsim_debug(dsim, "%s: decon state is %d\n", __func__, decon->state);
+		goto end_err_fg_handler;
+	}
+
+	recovering = atomic_read(&decon->recovery.recovering);
+	dsim_warn(dsim, "error flag detected (decon%d), try to recover (recovering=%d)",
+		decon->id, recovering);
+
+	decon_force_vblank_event(decon);
+	if (!recovering)
+		decon_trigger_recovery(decon);
+
+end_err_fg_handler:
+	dsim_debug(dsim, "%s -\n", __func__);
+
+	return IRQ_HANDLED;
+}
+
+static int dsim_register_err_fg_irq(struct dsim_device *dsim)
+{
+	struct device *dev = dsim->dev;
+	struct platform_device *pdev;
+	int ret, irq;
+
+	pdev = container_of(dev, struct platform_device, dev);
+	dsim->irq_err_fg = -1;
+
+	if (dsim->err_fg_gpio < 0) {
+		/* If the project doesn't specify the errfg-gpio, just return here */
+		dsim_debug(dsim, "No dedicated ERR_FG for dsim, skip irq registration\n");
+		return 0;
+	}
+
+	ret = gpio_to_irq(dsim->err_fg_gpio);
+	if (ret < 0) {
+		dsim_err(dsim, "Failed to get irq number for err_fg_gpio: %d\n", ret);
+		return ret;
+	}
+
+	irq = ret;
+	irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY);
+	ret = devm_request_irq(dsim->dev, irq, dsim_err_fg_irq_handler, IRQF_TRIGGER_RISING,
+			pdev->name, dsim);
+	if (ret) {
+		dsim_err(dsim, "Request err_fg irq number(%d) failed: %d\n", irq, ret);
+		return ret;
+	}
+	disable_irq(irq);
+	dsim->irq_err_fg = irq;
+	dsim_info(dsim, "Request err_fg irq number(%d) okay\n", irq);
+
+	return ret;
+}
+
 static int dsim_get_phys(struct dsim_device *dsim)
 {
 	if (IS_ENABLED(CONFIG_BOARD_EMULATOR))
@@ -1632,6 +1711,8 @@ static int dsim_init_resources(struct dsim_device *dsim)
 	ret = dsim_register_irq(dsim);
 	if (ret)
 		goto err;
+
+	dsim_register_err_fg_irq(dsim);
 
 	ret = dsim_get_phys(dsim);
 	if (ret)
@@ -1666,6 +1747,11 @@ static int dsim_host_attach(struct mipi_dsi_host *host,
 			dsim_err(dsim, "failed to create panel bridge\n");
 			return PTR_ERR(bridge);
 		}
+	}
+
+	if (IS_ERR_OR_NULL(dsim->encoder.dev)) {
+		dsim_err(dsim, "encoder is not initialized\n");
+		return PTR_ERR(dsim->encoder.dev);
 	}
 
 	ret = drm_bridge_attach(&dsim->encoder, bridge, NULL, 0);
@@ -1949,6 +2035,7 @@ dsim_write_data(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 		is_last = true;
 	}
 
+	trace_dsi_tx(msg->type, msg->tx_buf, msg->tx_len, is_last);
 	dsim_debug(dsim, "%s last command\n", is_last ? "" : "Not");
 
 	if (is_last) {
@@ -1989,6 +2076,7 @@ dsim_write_data(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 	}
 
 err:
+	trace_dsi_cmd_fifo_status(dsim->total_pend_ph, dsim->total_pend_pl);
 	DPU_ATRACE_END(__func__);
 	return ret;
 }
@@ -1997,16 +2085,18 @@ static int
 dsim_req_read_command(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 {
 	struct mipi_dsi_packet packet;
+	const u8 rx_len = msg->rx_len & 0xff;
 
 	dsim_reg_clear_int(dsim->id, DSIM_INTSRC_SFR_PH_FIFO_EMPTY);
 	reinit_completion(&dsim->ph_wr_comp);
-
+	trace_dsi_tx(MIPI_DSI_SET_MAXIMUM_RETURN_PACKET_SIZE, &rx_len, 1, true);
 	/* set the maximum packet size returned */
 	dsim_reg_wr_tx_header(dsim->id, MIPI_DSI_SET_MAXIMUM_RETURN_PACKET_SIZE,
 			msg->rx_len, 0, false);
 
 	/* read request */
 	mipi_dsi_create_packet(&packet, msg);
+	trace_dsi_tx(msg->type, msg->tx_buf, msg->tx_len, true);
 	dsim_reg_wr_tx_header(dsim->id, packet.header[0], packet.header[1],
 						packet.header[2], true);
 
@@ -2019,6 +2109,7 @@ dsim_read_data(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 	u32 rx_fifo, rx_size = 0;
 	int i = 0, ret = 0;
 	u8 *rx_buf = msg->rx_buf;
+	const u8 *tx_buf = msg->tx_buf;
 
 	if (msg->rx_len > MAX_RX_FIFO) {
 		dsim_err(dsim, "invalid rx len(%lu) max(%d)\n", msg->rx_len,
@@ -2103,6 +2194,7 @@ dsim_read_data(struct dsim_device *dsim, const struct mipi_dsi_msg *msg)
 		} while (!dsim_reg_rx_fifo_is_empty(dsim->id) && --retry_cnt);
 	}
 
+	trace_dsi_rx(tx_buf[0], rx_buf, rx_size);
 	return rx_size;
 }
 
@@ -2531,8 +2623,12 @@ static int dsim_probe(struct platform_device *pdev)
 		dsim_warn(dsim, "idle ip index is not provided\n");
 	exynos_update_ip_idle_status(dsim->idle_ip_index, 1);
 #endif
+	dsim->state = DSIM_STATE_HANDOVER;
 
-	dsim->state = DSIM_STATE_SUSPEND;
+	/* parse the panel name to select the dsi device for the detected panel */
+	dsim_parse_panel_name(dsim);
+
+	// TODO: get which panel is active from bootloader?
 
 	pm_runtime_use_autosuspend(dsim->dev);
 	pm_runtime_set_autosuspend_delay(dsim->dev, 20);
